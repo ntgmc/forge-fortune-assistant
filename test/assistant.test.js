@@ -3,9 +3,11 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
+const vm = require("node:vm");
 const { analyze, itemStats, boostAdvice, bestBooks, equipmentAdvice, partyScore,
   freeMastery, fusionCandidates, fusionHasSlot, nextPartyMove,
-  schedulePlaybookDialogClose, simulateDungeon, simulateFloor } =
+  schedulePlaybookDialogClose, simulateDungeon, simulateFloor, adventureWorkerSource,
+  adventureFingerprint, analyzeLiveSave } =
   require("../forge-fortune-assistant.user.js");
 
 const basicRecipe = (id, pts = 10) => ({
@@ -127,6 +129,98 @@ test("adventure falls back when an unlocked harder dungeon cannot clear floor on
   assert.ok(plan.areas.every((area) => area.simulation.floors >= 1));
 });
 
+test("one blocked region falls back without downgrading the other regions", () => {
+  const data = { ...fixture, dungeons: [
+    ...fixture.dungeons,
+    ...fixture.dungeons.map((dungeon, index) => ({
+      ...dungeon, id: `D${index + 1}02`, unlockedBy: "D401",
+      hp: index === 1 ? 100000 : 100, pow: index === 1 ? 100000 : 30
+    }))
+  ] };
+  const progress = { ...save, d: { dungeons: [
+    ...save.d.dungeons,
+    ...[1, 2, 3].map((area) => ({ id: `D${area}02`, status: 0, maxFloor: 0 })),
+    { id: "D401", status: 0, maxFloor: 1 }
+  ] } };
+  assert.deepEqual(analyze(progress, data).adventure.areas.map((area) => area.id),
+    ["D102", "D201", "D302"]);
+});
+
+test("observed second floor keeps left and right IX while blocked middle IX falls back", () => {
+  const data = { ...fixture, dungeons: [
+    ...fixture.dungeons,
+    ...fixture.dungeons.map((dungeon, index) => ({
+      ...dungeon, id: `D${index + 1}09`, unlockedBy: "D401",
+      hp: 100000, pow: 100000
+    }))
+  ] };
+  const states = save.d.dungeons.map((state) => ({ ...state, status: 0, floor: 1 }));
+  const running = (index) => ({
+    id: `D${index + 1}09`, status: 1, maxFloor: 0, floor: 2,
+    party: { heroID: save.d.dungeons[index].party.heroID },
+    lastPlaybook: Array(4).fill("PB1")
+  });
+  const progress = { ...save, d: { dungeons: [
+    ...states, running(0), { ...running(1), status: 0, floor: 1 },
+    running(2), { id: "D401", maxFloor: 1, status: 0 }
+  ] } };
+  const plan = analyze(progress, data).adventure;
+  assert.deepEqual(plan.areas.map((area) => area.id), ["D109", "D201", "D309"]);
+  assert.deepEqual(plan.areas.map((area) => !!area.observed), [true, false, true]);
+  assert.ok(plan.areas.every((area) => area.simulation.floors >= 1));
+  let response;
+  const context = { self: { postMessage: (message) => { response = message; } } };
+  vm.runInNewContext(adventureWorkerSource(), context);
+  context.self.onmessage({ data: { save: progress, config: data } });
+  assert.equal(response.error, undefined);
+  assert.deepEqual(JSON.parse(JSON.stringify(response.result.areas.map((area) =>
+    [area.id, !!area.observed]))), plan.areas.map((area) => [area.id, !!area.observed]));
+  assert.equal(adventureFingerprint(progress), adventureFingerprint({
+    ...progress, d: { dungeons: progress.d.dungeons.map((state) =>
+      state.status === 1 && state.floor > 1 ? { ...state, floor: 15 } : state) }
+  }));
+});
+
+test("observed victory requires matching running dungeon, roster and playbooks", () => {
+  const harder = { ...fixture.dungeons[0], id: "D109", unlockedBy: "D401",
+    hp: 100000, pow: 100000 };
+  const data = { ...fixture, dungeons: [...fixture.dungeons, harder] };
+  const run = {
+    id: "D109", status: 1, maxFloor: 0, floor: 2,
+    party: { heroID: save.d.dungeons[0].party.heroID },
+    lastPlaybook: Array(4).fill("PB1")
+  };
+  const progress = { ...save, d: { dungeons: [
+    { ...save.d.dungeons[0], status: 0 },
+    ...save.d.dungeons.slice(1), run, { id: "D401", maxFloor: 1, status: 0 }
+  ] } };
+  const first = (state) => analyze(state, data).adventure.areas[0];
+  assert.equal(first(progress).id, "D109");
+  const replace = (change) => ({ ...progress, d: { dungeons:
+    progress.d.dungeons.map((state) => state.id === "D109" ? { ...state, ...change } : state) } });
+  assert.equal(first(replace({ floor: 1 })).id, "D101");
+  assert.equal(first(replace({ party: { heroID: ["H0", "H0", "H2", "H3"] } })).id, "D101");
+  assert.equal(first(replace({ lastPlaybook: ["PB2", "PB1", "PB1", "PB1"] })).id, "D101");
+  assert.equal(first(replace({ id: "D108" })).id, "D101");
+});
+
+test("live analysis restarts on team changes and reads newest non-team values", async () => {
+  let live = save;
+  const calls = [];
+  const project = async (state) => {
+    calls.push(state);
+    if (calls.length === 1) live = { ...live, h: { heroes: live.h.heroes.map((hero, i) =>
+      i === 0 ? { ...hero, playbook: "PB2" } : hero) } };
+    else live = { ...live, ds: { ...live.ds, fuel: 42 } };
+    return { areas: [], reason: "测试中的冒险模拟" };
+  };
+  const result = await analyzeLiveSave(() => live, fixture, project);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].h.heroes[0].playbook, "PB2");
+  assert.equal(result.report.boost.fuel, 42);
+  assert.equal(result.save, live);
+});
+
 test("no simulated first-floor victory means no actionable party", () => {
   const data = { ...fixture, dungeons: fixture.dungeons.map((dungeon) =>
     ({ ...dungeon, pow: 1e6, hp: 1e6 })) };
@@ -156,6 +250,53 @@ test("ghost-area phase and evasion cost additional simulated turns", () => {
   assert.ok(simulateFloor([profile], def, evasive, skills, 1).turns > direct.turns);
 });
 
+test("unknown enemy skills cannot be counted as harmless", () => {
+  const profile = { hero: { hp: 200, pow: 40 }, book: {
+    skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000"
+  } };
+  const mob = { hpMod: 1, powMod: 1,
+    skill1: "SM_UNKNOWN", skill2: "S0000", skill3: "S0000", skill4: "S0000" };
+  assert.equal(simulateFloor([profile], { hp: 100, pow: 1 }, [mob],
+    new Map([["S0000", { powMod: 1 }]]), 1), null);
+});
+
+test("first-floor safety rejects a fragile team despite a baseline victory", () => {
+  const profile = { hero: { hp: 80, pow: 100 }, book: {
+    skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000"
+  } };
+  const mob = { hpMod: 1, powMod: 1,
+    skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000" };
+  const def = { hp: 100, pow: 80 };
+  const skills = new Map([["S0000", { powMod: 1 }]]);
+  assert.equal(simulateFloor([profile], def, [mob], skills, 1).cleared, true);
+  assert.equal(simulateFloor([profile], def, [mob], skills, 1, 1.2).cleared, false);
+});
+
+test("ghost-area falling rocks halve party HP rather than do nothing", () => {
+  const profile = { hero: { hp: 200, pow: 0 }, book: {
+    skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000"
+  } };
+  const mob = { hpMod: 1, powMod: 1,
+    skill1: "SM207", skill2: "SM207", skill3: "SM207", skill4: "SM207" };
+  const skills = new Map([
+    ["S0000", { powMod: 1 }], ["SM207", { powMod: 1 }]
+  ]);
+  assert.equal(simulateFloor([profile], { hp: 100, pow: 100 }, [mob],
+    skills, 1).remaining, 100);
+});
+
+test("worker combat search matches main-thread result", () => {
+  let response;
+  const context = { self: { postMessage: (message) => { response = message; } } };
+  vm.runInNewContext(adventureWorkerSource(), context);
+  context.self.onmessage({ data: { save, config: fixture } });
+  assert.equal(response.error, undefined);
+  assert.deepEqual(JSON.parse(JSON.stringify(response.result.areas.map((area) =>
+    [area.id, area.simulation.floors, area.members.map((hero) => hero.id)]))),
+  analyze(save, fixture).adventure.areas.map((area) =>
+    [area.id, area.simulation.floors, area.members.map((hero) => hero.id)]));
+});
+
 test("purchased unlock makes an unvisited dungeon eligible", () => {
   const data = { ...fixture, dungeons: [
     ...fixture.dungeons,
@@ -180,6 +321,7 @@ test("floor and live mobs never change adventure teams or skills", () => {
     books: area.profiles.map((profile) => profile.book.id)
   }));
   assert.deepEqual(plan(first), plan(second));
+  assert.strictEqual(first.adventure, second.adventure);
 });
 
 test("free mastery requires ownership, craft threshold, and zero cost", () => {

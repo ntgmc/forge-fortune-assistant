@@ -227,19 +227,28 @@
     return masks;
   }
 
+  const PROJECTED_ENEMY_SKILLS = new Set([
+    "S0000", "SM100", "SM101", "SM102", "SM103", "SM104", "SM105",
+    "SM107", "SM202", "SM203", "SM204", "SM205", "SM207", "SM208",
+    "SM300", "SM301", "SM302", "SM304", "SM305", "SM306", "SM307", "SM308"
+  ]);
+
   // Bounded deterministic combat projection: the game has additional random, rune and equipment effects.
-  function simulateFloor(profiles, def, mobDefs, skills, floor) {
-    if (!mobDefs?.length || mobDefs.some((mob) => !mob) || !Number.isFinite(def.hp)) return null;
-    const baseHp = def.hp + 10 * (floor - 1) * num(def.hpGain);
-    const basePow = def.pow + 10 * (floor - 1) * num(def.powGain);
+  function simulateFloor(profiles, def, mobDefs, skills, floor, pressure = 1) {
+    if (!mobDefs?.length || mobDefs.some((mob) => !mob ||
+      [mob.skill1, mob.skill2, mob.skill3, mob.skill4].some((id) =>
+        !PROJECTED_ENEMY_SKILLS.has(id) || !skills.has(id))) ||
+      !Number.isFinite(def.hp)) return null;
+    const baseHp = (def.hp + 10 * (floor - 1) * num(def.hpGain)) * pressure;
+    const basePow = (def.pow + 10 * (floor - 1) * num(def.powGain)) * pressure;
     const enemies = mobDefs.map((mob) => ({
       id: mob.id, hp: Math.max(1, Math.floor(baseHp * num(mob.hpMod))),
       maxHp: Math.max(1, Math.floor(baseHp * num(mob.hpMod))),
       pow: Math.floor(basePow * num(mob.powMod)), skills: [mob.skill1, mob.skill2, mob.skill3, mob.skill4],
-      phase: false, evade: 0
+      phase: false, evade: 0, protection: 0
     }));
     const heroes = profiles.map((profile) => ({
-      hp: profile.hero.hp, maxHp: profile.hero.hp, pow: profile.hero.pow,
+      hp: profile.hero.hp, maxHp: profile.hero.hp, pow: profile.hero.pow, healingPenalty: 1,
       skills: [profile.book.skill1, profile.book.skill2, profile.book.skill3, profile.book.skill4]
     }));
     let turns = 0;
@@ -261,7 +270,8 @@
                 .sort((a, b) => (b.maxHp - b.hp) - (a.maxHp - a.hp))[0]];
             for (const target of targets) {
               target.hp = Math.min(target.maxHp, target.hp +
-                Math.floor(hero.pow * (effect.healAll || effect.heal || effect.regen)));
+                Math.floor(hero.pow * (effect.healAll || effect.heal || effect.regen) *
+                  target.healingPenalty));
             }
           }
           guard = Math.max(guard, num(effect.guard));
@@ -274,7 +284,8 @@
               if (enemy.phase) continue;
               if (enemy.evade > 0) { enemy.evade--; continue; }
               enemy.hp = Math.max(0, enemy.hp -
-                Math.floor(power * (effect.frontFactor || 1) * (1 + damageBuff)));
+                Math.floor(power * (effect.frontFactor || 1) * (1 + damageBuff) *
+                  (1 - enemy.protection)));
             }
           }
         }
@@ -287,19 +298,50 @@
         enemy.phase = false;
         const id = enemy.skills[round % 4];
         const skill = skills.get(id);
-        const power = Math.floor(enemy.pow * (id === "S0000" ? 1 : num(skill?.powMod)));
+        let power = Math.floor(enemy.pow * (id === "S0000" ? 1 : num(skill?.powMod)));
         if (id === "SM205") enemy.phase = true;
-        else if (id === "SM208") {
+        else if (id === "SM305") enemy.protection = Math.max(enemy.protection, 0.25);
+        else if (id === "SM304") {
+          for (const ally of [enemies[index - 1], enemies[index + 1]]) {
+            if (ally?.hp > 0) ally.pow += Math.floor(enemy.pow * 0.2);
+          }
+        } else if (id === "SM208") {
           for (const ally of enemies) if (ally.hp > 0) ally.evade++;
-        } else if (id === "SM203") {
-          const target = [...enemies].filter((ally) => ally.hp > 0)
-            .sort((a, b) => (b.maxHp - b.hp) - (a.maxHp - a.hp))[0];
-          if (target) target.hp = Math.min(target.maxHp, target.hp + power);
-        } else if (id === "S0000" || /对.*(?:造成|攻击).*伤害/.test(skill?.description || "")) {
-          const targets = id === "SM204" || /所有敌人|全体敌人/.test(skill?.description || "") ?
-            heroes.filter((member) => member.hp > 0) : heroes.filter((member) => member.hp > 0).slice(0, 1);
-          for (const target of targets) target.hp = Math.max(0, target.hp -
-            Math.floor(power * (1 - Math.min(0.8, guard))));
+        } else if (["SM101", "SM105", "SM203", "SM308"].includes(id)) {
+          const alive = enemies.filter((ally) => ally.hp > 0);
+          const target = id === "SM203" ?
+            alive.sort((a, b) => (b.maxHp - b.hp) - (a.maxHp - a.hp))[0] :
+            id === "SM308" ? enemies[index - 1] : enemy;
+          if (id === "SM105" && enemy.hp < enemy.maxHp * 0.5) power =
+            Math.floor(power * (skill.mod2 || 1.5));
+          if (target?.hp > 0) target.hp = Math.min(target.maxHp, target.hp + power);
+        } else {
+          const alive = heroes.filter((member) => member.hp > 0);
+          const targets = ["SM204", "SM306"].includes(id) ? alive :
+            id === "SM302" ? alive.slice(-1) :
+            id === "SM307" ? [alive.reduce((lowest, member) =>
+              member.hp < lowest.hp ? member : lowest)] : alive.slice(0, 1);
+          if (id === "SM207") {
+            for (const target of alive) target.hp = Math.min(target.hp,
+              Math.ceil(target.maxHp * 0.5));
+          } else {
+            if (id === "SM103" && enemy.hp === enemy.maxHp) power =
+              Math.floor(power * (skill.mod1 || 1.5));
+            if (id === "SM104") power = Math.floor(power * (skill.mod1 || 2));
+            if (id === "SM107" && enemy.hp < enemy.maxHp) power =
+              Math.floor(power * (skill.mod2 || 3));
+            if (id === "SM202" && targets[0]?.hp < targets[0]?.maxHp * 0.5) power =
+              Math.floor(power * (skill.mod2 || 1.5));
+            if (id === "SM301") power = Math.floor(
+              targets[0]?.maxHp * (skill.mod1 || 0.2));
+            for (const target of targets) target.hp = Math.max(0, target.hp -
+              Math.floor(power * (1 - Math.min(0.8, guard))));
+            if (id === "SM102" && targets[0]) targets[0].healingPenalty = 0.5;
+            if (id === "SM100") for (const ally of enemies) {
+              if (ally.hp > 0) ally.hp = Math.min(ally.maxHp, ally.hp + power);
+            }
+            if (id === "SM306") enemy.hp = 0;
+          }
         }
         if (heroes.every((member) => member.hp <= 0)) return { cleared: false, turns, remaining: 0 };
       }
@@ -307,20 +349,101 @@
     return { cleared: false, turns, remaining: sum(heroes.map((member) => member.hp)) };
   }
 
-  function simulateDungeon(profiles, def, mobs, skills, limit = 8) {
+  function simulateDungeon(profiles, def, mobs, skills, limit = 20) {
     const mobDefs = [def.mob1, def.mob2, def.mob3, def.mob4].filter(Boolean)
       .map((id) => mobs.get(id));
+    const front = profiles.reduce((best, profile) =>
+      profile.hero.hp > best.hero.hp ? profile : best);
+    const ordered = [front, ...profiles.filter((profile) => profile !== front)];
     let floors = 0;
     let last = null;
+    let lastVictory = null;
     for (let floor = 1; floor <= limit; floor++) {
-      last = simulateFloor(profiles, def, mobDefs, skills, floor);
+      last = simulateFloor(ordered, def, mobDefs, skills, floor);
       if (!last?.cleared) break;
       floors++;
+      lastVictory = last;
     }
-    return { floors, remaining: last?.remaining || 0, complete: last !== null };
+    return { floors, remaining: lastVictory?.remaining || 0,
+      turns: lastVictory?.turns || 0, complete: last !== null };
   }
 
+  function passesSafetyFloor(profiles, def, mobs, skills) {
+    const mobDefs = [def.mob1, def.mob2, def.mob3, def.mob4].filter(Boolean)
+      .map((id) => mobs.get(id));
+    if (mobDefs.some((mob) => !mob)) return false;
+    const front = profiles.reduce((best, profile) =>
+      profile.hero.hp > best.hero.hp ? profile : best);
+    const ordered = [front, ...profiles.filter((profile) => profile !== front)];
+    return simulateFloor(ordered, def, mobDefs, skills, 1, 1.2)?.cleared === true;
+  }
+
+  function improveSimulatedBooks(save, data, entry, mobs, skills) {
+    let profiles = [...entry.profiles];
+    let simulation = simulateDungeon(profiles, entry.def, mobs, skills);
+    const hp = sum(entry.members.map((member) => member.hp));
+    const fitness = (result, safe) => (safe ? 1e9 : 0) + result.floors * 1e6 +
+      result.remaining / Math.max(1, hp) * 100 - result.turns * 0.001;
+    let safe = passesSafetyFloor(profiles, entry.def, mobs, skills);
+    for (let pass = 0; pass < 2; pass++) {
+      let improved = false;
+      for (let index = 0; index < profiles.length; index++) {
+        for (const option of skillOptions(save, data, entry.members[index], entry.encounter.enemies)) {
+          if (option.book.id === profiles[index].book.id) continue;
+          const trial = [...profiles];
+          trial[index] = option;
+          const tested = simulateDungeon(trial, entry.def, mobs, skills);
+          const trialSafe = passesSafetyFloor(trial, entry.def, mobs, skills);
+          if (fitness(tested, trialSafe) > fitness(simulation, safe) + 0.00001) {
+            profiles = trial;
+            simulation = tested;
+            safe = trialSafe;
+            improved = true;
+          }
+        }
+      }
+      if (!improved) break;
+    }
+    return { profiles, simulation, safe, ...partyScore(profiles, entry.encounter) };
+  }
+
+  let cachedAdventure = null;
+  function adventureFingerprint(save) {
+    return JSON.stringify({
+      heroes: (save.h?.heroes || []).map((hero) => ({
+        id: hero.id, owned: hero.owned, playbook: hero.playbook, gearSlots: hero.gearSlots
+      })),
+      books: save.pb?.playbookDB,
+      perks: save.sh?.perks?.filter((perk) => perk.purchased).map((perk) => perk.id),
+      dungeons: save.d?.dungeons?.map((state) => ({
+        id: state.id, status: state.status, unlocked: state.maxFloor > 0,
+        party: state.party?.heroID,
+        confirmedFirstFloor: state.status === 1 && state.floor > 1,
+        lastPlaybook: state.status === 1 ? state.lastPlaybook : undefined
+      }))
+    });
+  }
+  async function analyzeLiveSave(readSave, data, project) {
+    let save = readSave();
+    while (true) {
+      const fingerprint = adventureFingerprint(save);
+      const projected = await project(save, data);
+      const latest = readSave();
+      if (adventureFingerprint(latest) === fingerprint) {
+        return { save: latest, report: analyze(latest, data, projected) };
+      }
+      save = latest;
+    }
+  }
   function adventureAdvice(save, data, heroes) {
+    const fingerprint = adventureFingerprint(save);
+    if (cachedAdventure?.data === data && cachedAdventure.fingerprint === fingerprint) {
+      return cachedAdventure.result;
+    }
+    const finish = (result) => {
+      cachedAdventure = { data, fingerprint, result };
+      return result;
+    };
     const states = indexById(save.d?.dungeons);
     const purchased = new Set((save.sh?.perks || []).filter((perk) => perk.purchased).map((perk) => perk.id));
     const mobs = indexById(data.mobs);
@@ -346,7 +469,7 @@
     });
     if (areas.some((area) => !area.length) ||
         heroes.length < sum(areas.map((area) => area[0].size)) || heroes.length > 15) {
-      return { areas: [], reason: "需要三个已开放区域和足够的英雄才能计算互不冲突的分队。" };
+      return finish({ areas: [], reason: "需要三个已开放区域和足够的英雄才能计算互不冲突的分队。" });
     }
     const candidate = areas.map((variants) => {
       const results = new Map();
@@ -359,13 +482,39 @@
           return optimized && { ...area, mask, members, ...optimized };
         }).filter(Boolean);
         for (const entry of preliminary) {
-          const simulation = simulateDungeon(entry.profiles, entry.def, mobs, skills);
-          if (simulation.complete && simulation.floors >= 1) {
-            const result = { ...entry, simulation,
-              value: simulation.floors * 1e6 + entry.tier * 1000 +
+          const optimized = improveSimulatedBooks(save, data, entry, mobs, skills);
+          const { simulation } = optimized;
+          if (simulation.complete && simulation.floors >= 1 && optimized.safe) {
+            const result = { ...entry, ...optimized,
+              value: entry.tier * 1e6 + simulation.floors * 1000 +
                 simulation.remaining / Math.max(1, sum(entry.members.map((member) => member.hp))) };
             if (!results.has(entry.mask) || results.get(entry.mask).value < result.value) {
               results.set(entry.mask, result);
+            }
+          }
+        }
+        const running = area.running;
+        if (running?.id === area.id && running.floor > 1 &&
+            area.current.length === area.size && new Set(area.current).size === area.size &&
+            running.lastPlaybook?.length === area.current.length) {
+          const entry = preliminary.find((candidate) =>
+            area.current.every((id) => candidate.members.some((member) => member.id === id)));
+          if (entry) {
+            const profiles = entry.members.map((member) =>
+              skillOptions(save, data, member, area.encounter.enemies)
+                .find((profile) => profile.book.id === member.playbook));
+            const booksMatch = area.current.every((id, index) =>
+              entry.members.find((member) => member.id === id)?.playbook ===
+                running.lastPlaybook[index]);
+            if (booksMatch && profiles.every(Boolean)) {
+              const measured = simulateDungeon(profiles, entry.def, mobs, skills);
+              const simulation = { ...measured, floors: Math.max(1, measured.floors) };
+              const observed = { ...entry, ...partyScore(profiles, entry.encounter),
+                profiles, simulation, observed: true,
+                value: entry.tier * 1e6 + simulation.floors * 1000 + 0.1 };
+              if (!results.has(entry.mask) || observed.value > results.get(entry.mask).value) {
+                results.set(entry.mask, observed);
+              }
             }
           }
         }
@@ -373,7 +522,7 @@
       return [...results.values()];
     });
     if (candidate.some((entries) => !entries.length)) {
-      return { areas: [], reason: "至少有一个区域没有模拟通过首层的候选队伍；自动编队已暂停。请核对装备、解锁和模拟数据。" };
+      return finish({ areas: [], reason: "至少有一个区域既无模拟通过首层的安全候选，也无当前队伍的实战通关记录；自动编队已暂停。" });
     }
     const full = (1 << heroes.length) - 1;
     const bestThird = Array(1 << heroes.length).fill(null);
@@ -393,17 +542,45 @@
         if (first.mask & second.mask) continue;
         const third = bestThird[full ^ (first.mask | second.mask)];
         if (!third) continue;
+        const entries = [first, second, third];
+        const minTier = Math.min(...entries.map((entry) => entry.tier));
+        const progress = sum(entries.map((entry) =>
+          (entry.tier - 1) * 20 + entry.simulation.floors));
         const total = first.value + second.value + third.value;
-        if (!optimal || total > optimal.total) optimal = { total, entries: [first, second, third] };
+        if (!optimal || progress > optimal.progress ||
+            (progress === optimal.progress && (minTier > optimal.minTier ||
+              (minTier === optimal.minTier && total > optimal.total)))) {
+          optimal = { minTier, progress, total, entries };
+        }
       }
     }
-    if (!optimal) return { areas: [], reason: "未找到三个区域互不冲突且均模拟通过首层的队伍；自动编队已暂停。" };
-    return { areas: areas.map((area, index) => {
+    if (!optimal) return finish({ areas: [], reason: "未找到三个区域互不冲突且均模拟通过首层的队伍；自动编队已暂停。" });
+    return finish({ areas: areas.map((area, index) => {
       const entry = optimal.entries[index];
       const ordered = [entry.front, ...entry.members.filter((hero) => hero !== entry.front)];
       return { ...entry, members: ordered,
         changed: ordered.filter((hero) => !entry.current.includes(hero.id)) };
-    }), total: optimal.total };
+    }), progress: optimal.progress, total: optimal.total });
+  }
+
+  function adventureWorkerSource() {
+    const helpers = [indexById, sum, num, itemStats, heroesFromSave, bookProfile,
+      skillOptions, partyScore, bestBooks, combinations, simulateFloor,
+      simulateDungeon, passesSafetyFloor, improveSimulatedBooks,
+      adventureFingerprint, adventureAdvice];
+    return `const EFFECTS = ${JSON.stringify(EFFECTS)};
+      const PROJECTED_ENEMY_SKILLS = new Set(${JSON.stringify([...PROJECTED_ENEMY_SKILLS])});
+      ${helpers.map((helper, index) => index < 3
+        ? `const ${helper.name} = ${helper.toString()};` : helper.toString()).join("\n")}
+      let cachedAdventure = null;
+      self.onmessage = ({data}) => {
+        try {
+          const {save, config} = data;
+          self.postMessage({result: adventureAdvice(save, config, heroesFromSave(save, config))});
+        } catch (error) {
+          self.postMessage({error: error.message});
+        }
+      };`;
   }
 
   function skillAdvice(adventure) {
@@ -479,7 +656,7 @@
     return { plans, inventory };
   }
 
-  function analyze(save, data) {
+  function analyze(save, data, projectedAdventure) {
     if (!Array.isArray(save?.h?.heroes) || !Array.isArray(save?.d?.dungeons) ||
         !Array.isArray(data?.recipes) || !Array.isArray(data.heroes) ||
         !Array.isArray(data.dungeons) || !Array.isArray(data.mobs) || !Array.isArray(data.playbook) ||
@@ -488,7 +665,7 @@
       throw new Error("存档或游戏配置缺少战力分析所需字段");
     }
     const heroes = heroesFromSave(save, data);
-    const adventure = adventureAdvice(save, data, heroes);
+    const adventure = projectedAdventure || adventureAdvice(save, data, heroes);
     return {
       boost: boostAdvice(save, data), adventure,
       skills: skillAdvice(adventure),
@@ -557,7 +734,7 @@
     module.exports = { itemStats, heroesFromSave, boostAdvice, adventureAdvice,
       skillAdvice, equipmentAdvice, analyze, partyScore, bestBooks, freeMastery,
       fusionCandidates, fusionHasSlot, nextPartyMove, schedulePlaybookDialogClose,
-      simulateDungeon, simulateFloor };
+      simulateDungeon, simulateFloor, adventureWorkerSource, adventureFingerprint, analyzeLiveSave };
   }
   if (typeof document === "undefined" || !location.pathname.startsWith("/forge-fortune")) return;
 
@@ -606,17 +783,9 @@
   heading.textContent = "Forge & Fortune · 战力助手";
   const controls = document.createElement("div");
   controls.className = "controls";
-  const live = document.createElement("button");
-  live.textContent = "实时存档";
   const refreshButton = document.createElement("button");
   refreshButton.textContent = "刷新";
-  const importButton = document.createElement("button");
-  importButton.textContent = "导入存档文件";
-  const file = document.createElement("input");
-  file.type = "file";
-  file.accept = ".txt,text/plain";
-  file.hidden = true;
-  controls.append(live, refreshButton, importButton, file);
+  controls.append(refreshButton);
   const nav = document.createElement("nav");
   const tabs = ["加速", "冒险", "技能", "装备"];
   let tab = 0;
@@ -657,7 +826,7 @@
   status.className = "status";
   const actionStatus = document.createElement("div");
   actionStatus.className = "status";
-  actionStatus.textContent = "仅在实时存档模式及游戏对应界面打开时执行自动操作。";
+  actionStatus.textContent = "仅在游戏对应界面打开时执行自动操作。";
   const body = document.createElement("div");
   panel.append(header, status, actionStatus, body);
   root.append(panel, toggle);
@@ -667,10 +836,10 @@
     toggle.textContent = panel.hidden ? "战力助手 ▴" : "战力助手 ▾";
   });
 
-  let snapshot = null;
-  let source = "实时存档";
   let config = null;
   let report = null;
+  let solvedAdventure = null;
+  let pendingAdventure = null;
   const attemptedMastery = new Set();
   const attemptedFusion = new Set();
   const visible = (element) => element && element.getClientRects().length > 0;
@@ -686,7 +855,9 @@
     if (!visible(teamView) || !selectedDungeon || !window.jQuery ||
         document.querySelector("#dialogContainer")) return false;
     const id = gameData(selectedDungeon, "dungeonID");
-    const area = analyze(save, config).adventure.areas.find((entry) => entry.id === id && !entry.running);
+    if (solvedAdventure?.fingerprint !== adventureFingerprint(save) ||
+        solvedAdventure.data !== config) return false;
+    const area = solvedAdventure.result.areas.find((entry) => entry.id === id && !entry.running);
     if (!area) return false;
     const desired = area.members.map((hero) => hero.id);
     const selected = [...document.querySelectorAll("#dungeonTeamCollection .partyCardClick")];
@@ -738,10 +909,6 @@
 
   function runAutomation() {
     if (!config || !Object.values(automation).some((input) => input.checked)) return;
-    if (snapshot !== null) {
-      action("导入存档仅供分析，自动操作已暂停。");
-      return;
-    }
     try {
       if (document.querySelector("#dialogContainer")) return;
       const text = localStorage.getItem("ffgs1");
@@ -822,18 +989,19 @@
     } else if (tab === 1) {
       const adventure = report.adventure;
         notice(adventure.areas.length
-          ? "按预计通关层数总和分配三个区域，难度可回退；每区至少模拟通过首层才推荐。进行中不能调整技能，调整队伍会重置进度。"
+          ? `模拟验证或当前队伍实战过首层后，三区累计预计推进 ${adventure.progress} 层（跨难度按每级 20 层折算）。进行中不能调整技能，调整队伍会重置进度。`
         : adventure.reason);
       for (const area of adventure.areas) {
         const members = [area.front, ...area.members.filter((hero) => hero !== area.front)];
-          section(`${area.name} · ${area.id} · 预计通过 ${area.simulation.floors} 层（最多模拟 8 层）`, [
+          section(`${area.name} · ${area.id} · ${area.observed ? "当前队伍实战已过首层" :
+            `预计通过 ${area.simulation.floors} 层（最多模拟 20 层）`}`, [
             [`${area.running ? `正在进行 ${area.running.id}，下次出发推荐` : "出发推荐"}：${members.map((hero) => hero.name).join(" → ")}`, "positive"],
           [`较当前队伍需换入：${area.changed.map((hero) => hero.name).join("、") || "无"}`, ""],
           [`前排集火 ${formatted(area.focus)} · 多目标溢出伤害 ${formatted(area.spread)} · 估计敌方压力 ${formatted(area.pressure)}`, "muted"],
           [`治疗约 ${formatted(area.healing)} · 减伤/控场约 ${formatted(area.guards)} · 提前击杀收益约 ${formatted(area.earlyKill)}${area.synergy ? ` · 状态联动约 ${formatted(area.synergy)}` : ""}`, "muted"]
         ]);
       }
-        line(body, "回合模拟使用怪物配置、技能与生命倍率；装备特效、符文、随机效果和部分状态未完整还原，不保证实际通关。", "status");
+        line(body, "首层压力测试将敌方生命与伤害提高 20%；模型未完整还原装备特效、符文、随机效果和部分状态，仍不保证实际通关。", "status");
     } else if (tab === 2) {
         notice("各区域为下次出发联动选择已解锁技能，并以回合模拟检验队伍；开打后技能无法调整。");
       for (const area of report.adventure.areas) {
@@ -881,17 +1049,6 @@
     }
     return save;
   }
-  async function parseExport(text) {
-    const encoded = text.trim();
-    if (encoded.startsWith("{") || encoded.startsWith('"')) return parseSave(encoded);
-    const bytes = Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0));
-    if (typeof DecompressionStream === "undefined") {
-      if (!window.pako) throw new Error("此浏览器不支持 gzip 解压");
-      return parseSave(window.pako.ungzip(bytes, { to: "string" }));
-    }
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
-    return parseSave(await new Response(stream).text());
-  }
   async function loadConfig() {
     if (config) return config;
     const keys = ["recipes", "materials", "heroes", "dungeons", "mobs", "playbook", "skills", "misc"];
@@ -904,39 +1061,92 @@
       [key, key === "misc" ? values[index][0] : values[index]]));
     return config;
   }
-  async function refresh() {
+  async function projectAdventure(save, data) {
+    const fingerprint = adventureFingerprint(save);
+    if (solvedAdventure?.data === data && solvedAdventure.fingerprint === fingerprint) {
+      return solvedAdventure.result;
+    }
+    if (pendingAdventure?.data === data && pendingAdventure.fingerprint === fingerprint) {
+      return pendingAdventure.promise;
+    }
+    const promise = new Promise((resolve, reject) => {
+      if (typeof Worker === "undefined") {
+        reject(new Error("浏览器不支持后台模拟，已暂停冒险推荐和自动编队"));
+        return;
+      }
+      const url = URL.createObjectURL(new Blob([adventureWorkerSource()], { type: "text/javascript" }));
+      let worker;
+      let timeout;
+      const cleanup = () => {
+        clearTimeout(timeout);
+        worker?.terminate();
+        URL.revokeObjectURL(url);
+      };
+      try {
+        worker = new Worker(url);
+        worker.onmessage = ({ data: message }) => {
+          cleanup();
+          if (message.error) reject(new Error(message.error));
+          else resolve(message.result);
+        };
+        worker.onerror = (error) => {
+          cleanup();
+          reject(new Error(`模拟线程失败：${error.message}`));
+        };
+        timeout = setTimeout(() => {
+          cleanup();
+          reject(new Error("模拟超时，请检查浏览器性能"));
+        }, 30000);
+        worker.postMessage({ save, config: data });
+      } catch (error) {
+        cleanup();
+        reject(error);
+      }
+    });
+    pendingAdventure = { data, fingerprint, promise };
     try {
-      const text = snapshot ?? localStorage.getItem("ffgs1");
-      if (!text) throw new Error("未找到游戏存档；可加载预置导出文件。");
-      const save = parseSave(text);
-      report = analyze(save, await loadConfig());
+      const result = await promise;
+      if (pendingAdventure?.promise === promise) {
+        solvedAdventure = { data, fingerprint, result };
+      }
+      return result;
+    } finally {
+      if (pendingAdventure?.promise === promise) pendingAdventure = null;
+    }
+  }
+  let refreshVersion = 0;
+  async function refresh() {
+    const version = ++refreshVersion;
+    try {
+      const readSave = () => {
+        const text = localStorage.getItem("ffgs1");
+        if (!text) throw new Error("未找到网页实时存档，请先在游戏中保存进度。");
+        return parseSave(text);
+      };
+      readSave();
+      const data = await loadConfig();
+      if (version !== refreshVersion) return;
+      report = null;
+      body.replaceChildren();
       status.className = "status";
-      status.textContent = `${source} · ${Number.isFinite(save.saveTime)
-        ? new Date(save.saveTime).toLocaleString("zh-CN") : "时间未知"}`;
+      status.textContent = "正在后台模拟三处冒险…";
+      const result = await analyzeLiveSave(readSave, data, projectAdventure);
+      if (version !== refreshVersion) return;
+      report = result.report;
+      status.className = "status";
+      status.textContent = `实时存档 · ${Number.isFinite(result.save.saveTime)
+        ? new Date(result.save.saveTime).toLocaleString("zh-CN") : "时间未知"}`;
       render();
     } catch (error) {
+      if (version !== refreshVersion) return;
       report = null;
       body.replaceChildren();
       status.className = "status error";
       status.textContent = `分析失败：${error.message}`;
     }
   }
-  live.addEventListener("click", () => { snapshot = null; source = "实时存档"; refresh(); });
   refreshButton.addEventListener("click", refresh);
-  importButton.addEventListener("click", () => file.click());
-  file.addEventListener("change", async () => {
-    if (!file.files?.[0]) return;
-    try {
-      snapshot = JSON.stringify(await parseExport(await file.files[0].text()));
-      source = file.files[0].name;
-      await refresh();
-    } catch (error) {
-      status.className = "status error";
-      status.textContent = `导入失败：${error.message}`;
-    }
-    file.value = "";
-  });
   refresh();
   setInterval(runAutomation, 1500);
-  setInterval(() => { if (snapshot === null && !panel.hidden) refresh(); }, 10000);
+  setInterval(() => { if (!pendingAdventure && !panel.hidden) refresh(); }, 10000);
 })();
