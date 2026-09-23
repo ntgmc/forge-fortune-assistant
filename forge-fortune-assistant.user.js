@@ -458,9 +458,9 @@
       const running = (save.d?.dungeons || []).find((entry) =>
         entry.id.startsWith(prefix) && entry.status === 1);
       const current = running?.party?.heroID || [];
-      return choices.map((def) => ({
+      return choices.slice(0, 1).map((def) => ({
         id: def.id, name: def.name, state: states.get(def.id), def, running, current,
-        size: def.partySize, tier: Number(def.id.slice(-2)),
+        size: def.partySize,
         encounter: {
           enemies: [def.mob1, def.mob2, def.mob3, def.mob4].filter(Boolean).length,
           pow: def.pow, frontHp: def.hp * (mobs.get(def.mob1)?.hpMod ?? 1)
@@ -484,13 +484,12 @@
         for (const entry of preliminary) {
           const optimized = improveSimulatedBooks(save, data, entry, mobs, skills);
           const { simulation } = optimized;
-          if (simulation.complete && simulation.floors >= 1 && optimized.safe) {
-            const result = { ...entry, ...optimized,
-              value: entry.tier * 1e6 + simulation.floors * 1000 +
-                simulation.remaining / Math.max(1, sum(entry.members.map((member) => member.hp))) };
-            if (!results.has(entry.mask) || results.get(entry.mask).value < result.value) {
-              results.set(entry.mask, result);
-            }
+          const validated = simulation.complete && simulation.floors >= 1 && optimized.safe;
+          const value = (validated ? 1e9 : simulation.complete && simulation.floors >= 1 ? 1e8 : 0) +
+            simulation.floors * 1e6 + Math.max(-1e5, Math.min(1e5, optimized.score));
+          const result = { ...entry, ...optimized, validated, value };
+          if (!results.has(entry.mask) || results.get(entry.mask).value < value) {
+            results.set(entry.mask, result);
           }
         }
         const running = area.running;
@@ -509,9 +508,11 @@
             if (booksMatch && profiles.every(Boolean)) {
               const measured = simulateDungeon(profiles, entry.def, mobs, skills);
               const simulation = { ...measured, floors: Math.max(1, measured.floors) };
-              const observed = { ...entry, ...partyScore(profiles, entry.encounter),
-                profiles, simulation, observed: true,
-                value: entry.tier * 1e6 + simulation.floors * 1000 + 0.1 };
+              const metrics = partyScore(profiles, entry.encounter);
+              const observed = { ...entry, ...metrics,
+                profiles, simulation, observed: true, validated: true,
+                value: 1e9 + simulation.floors * 1e6 +
+                  Math.max(-1e5, Math.min(1e5, metrics.score)) };
               if (!results.has(entry.mask) || observed.value > results.get(entry.mask).value) {
                 results.set(entry.mask, observed);
               }
@@ -522,7 +523,7 @@
       return [...results.values()];
     });
     if (candidate.some((entries) => !entries.length)) {
-      return finish({ areas: [], reason: "至少有一个区域既无模拟通过首层的安全候选，也无当前队伍的实战通关记录；自动编队已暂停。" });
+      return finish({ areas: [], reason: "最高难度缺少可用怪物配置或技能组合，无法生成三区编队。" });
     }
     const full = (1 << heroes.length) - 1;
     const bestThird = Array(1 << heroes.length).fill(null);
@@ -543,18 +544,14 @@
         const third = bestThird[full ^ (first.mask | second.mask)];
         if (!third) continue;
         const entries = [first, second, third];
-        const minTier = Math.min(...entries.map((entry) => entry.tier));
-        const progress = sum(entries.map((entry) =>
-          (entry.tier - 1) * 20 + entry.simulation.floors));
+        const progress = sum(entries.map((entry) => entry.simulation.floors));
         const total = first.value + second.value + third.value;
-        if (!optimal || progress > optimal.progress ||
-            (progress === optimal.progress && (minTier > optimal.minTier ||
-              (minTier === optimal.minTier && total > optimal.total)))) {
-          optimal = { minTier, progress, total, entries };
+        if (!optimal || total > optimal.total) {
+          optimal = { progress, total, entries };
         }
       }
     }
-    if (!optimal) return finish({ areas: [], reason: "未找到三个区域互不冲突且均模拟通过首层的队伍；自动编队已暂停。" });
+    if (!optimal) return finish({ areas: [], reason: "最高难度没有三个互不冲突的可用队伍，自动编队已暂停。" });
     return finish({ areas: areas.map((area, index) => {
       const entry = optimal.entries[index];
       const ordered = [entry.front, ...entry.members.filter((hero) => hero !== entry.front)];
@@ -1057,7 +1054,8 @@
     const id = gameData(selectedDungeon, "dungeonID");
     if (solvedAdventure?.fingerprint !== adventureFingerprint(save) ||
         solvedAdventure.data !== config) return false;
-    const area = solvedAdventure.result.areas.find((entry) => entry.id === id && !entry.running);
+    const area = solvedAdventure.result.areas.find((entry) =>
+      entry.id === id && !entry.running && entry.validated);
     if (!area) return false;
     const desired = area.members.map((hero) => hero.id);
     const selected = [...document.querySelectorAll("#dungeonTeamCollection .partyCardClick")];
@@ -1201,12 +1199,13 @@
     } else if (tab === 1) {
       const adventure = report.adventure;
         notice(adventure.areas.length
-          ? `模拟验证或当前队伍实战过首层后，三区累计预计推进 ${adventure.progress} 层（跨难度按每级 20 层折算）。进行中不能调整技能，调整队伍会重置进度。`
-        : adventure.reason);
+          ? `三区均按当前最高已解锁难度推荐；${adventure.areas.filter((area) => area.validated).length}/3 处通过首层模拟压力测试或实战验证，模拟合计预计通过 ${adventure.progress} 层。未验证队伍不会自动编队。进行中不能调整技能，调整队伍会重置进度。`
+          : adventure.reason);
       for (const area of adventure.areas) {
         const members = [area.front, ...area.members.filter((hero) => hero !== area.front)];
           section(`${area.name} · ${area.id} · ${area.observed ? "当前队伍实战已过首层" :
-            `预计通过 ${area.simulation.floors} 层（最多模拟 20 层）`}`, [
+            area.validated ? `预计通过 ${area.simulation.floors} 层（最多模拟 20 层）` :
+              `首层未验证${area.simulation.floors ? ` · 基础模拟通过 ${area.simulation.floors} 层` : ""}`}`, [
             [`${area.running ? `正在进行 ${area.running.id}，下次出发推荐` : "出发推荐"}：${members.map((hero) => hero.name).join(" → ")}`, "positive"],
           [`较当前队伍需换入：${area.changed.map((hero) => hero.name).join("、") || "无"}`, ""],
           [`前排集火 ${formatted(area.focus)} · 多目标溢出伤害 ${formatted(area.spread)} · 估计敌方压力 ${formatted(area.pressure)}`, "muted"],

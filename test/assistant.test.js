@@ -113,7 +113,7 @@ test("adventure targets highest unlocked tier even when a lower tier is running"
   assert.equal(area.encounter.frontHp, 150);
 });
 
-test("adventure falls back when an unlocked harder dungeon cannot clear floor one", () => {
+test("adventure keeps the highest unlocked tier when the model cannot clear its first floor", () => {
   const base = fixture.dungeons[1];
   const data = { ...fixture, dungeons: [
     ...fixture.dungeons,
@@ -126,11 +126,12 @@ test("adventure falls back when an unlocked harder dungeon cannot clear floor on
   ] } };
   const plan = analyze(progress, data).adventure;
   assert.equal(plan.areas.length, 3);
-  assert.equal(plan.areas[1].id, "D201");
-  assert.ok(plan.areas.every((area) => area.simulation.floors >= 1));
+  assert.equal(plan.areas[1].id, "D202");
+  assert.equal(plan.areas[1].validated, false);
+  assert.equal(plan.areas[1].simulation.floors, 0);
 });
 
-test("one blocked region falls back without downgrading the other regions", () => {
+test("three regions stay at their highest tiers even if one fails simulation", () => {
   const data = { ...fixture, dungeons: [
     ...fixture.dungeons,
     ...fixture.dungeons.map((dungeon, index) => ({
@@ -143,11 +144,34 @@ test("one blocked region falls back without downgrading the other regions", () =
     ...[1, 2, 3].map((area) => ({ id: `D${area}02`, status: 0, maxFloor: 0 })),
     { id: "D401", status: 0, maxFloor: 1 }
   ] } };
-  assert.deepEqual(analyze(progress, data).adventure.areas.map((area) => area.id),
-    ["D102", "D201", "D302"]);
+  const plan = analyze(progress, data).adventure;
+  assert.deepEqual(plan.areas.map((area) => area.id), ["D102", "D202", "D302"]);
+  assert.deepEqual(plan.areas.map((area) => area.validated), [true, false, true]);
 });
 
-test("observed second floor keeps left and right IX while blocked middle IX falls back", () => {
+test("shared D408 unlock fixes all three regions at IX despite stronger VIII simulations", () => {
+  const data = { ...fixture, dungeons: [
+    ...fixture.dungeons,
+    ...fixture.dungeons.flatMap((dungeon, index) => [
+      { ...dungeon, id: `D${index + 1}08`, unlockedBy: "D407" },
+      { ...dungeon, id: `D${index + 1}09`, unlockedBy: "D408",
+        hp: 100000, pow: 100000 }
+    ])
+  ] };
+  const progress = { ...save, d: { dungeons: [
+    ...save.d.dungeons,
+    ...[1, 2, 3].flatMap((area) => [
+      { id: `D${area}08`, maxFloor: 4, status: 0 },
+      { id: `D${area}09`, maxFloor: 0, status: 0 }
+    ]),
+    { id: "D408", maxFloor: 1, status: 0 }
+  ] } };
+  const plan = analyze(progress, data).adventure;
+  assert.deepEqual(plan.areas.map((area) => area.id), ["D109", "D209", "D309"]);
+  assert.ok(plan.areas.every((area) => !area.validated));
+});
+
+test("observed second floor validates two IX regions while the third stays at IX", () => {
   const data = { ...fixture, dungeons: [
     ...fixture.dungeons,
     ...fixture.dungeons.map((dungeon, index) => ({
@@ -166,9 +190,9 @@ test("observed second floor keeps left and right IX while blocked middle IX fall
     running(2), { id: "D401", maxFloor: 1, status: 0 }
   ] } };
   const plan = analyze(progress, data).adventure;
-  assert.deepEqual(plan.areas.map((area) => area.id), ["D109", "D201", "D309"]);
+  assert.deepEqual(plan.areas.map((area) => area.id), ["D109", "D209", "D309"]);
   assert.deepEqual(plan.areas.map((area) => !!area.observed), [true, false, true]);
-  assert.ok(plan.areas.every((area) => area.simulation.floors >= 1));
+  assert.deepEqual(plan.areas.map((area) => area.validated), [true, false, true]);
   let response;
   const context = { self: { postMessage: (message) => { response = message; } } };
   vm.runInNewContext(adventureWorkerSource(), context);
@@ -182,7 +206,7 @@ test("observed second floor keeps left and right IX while blocked middle IX fall
   }));
 });
 
-test("observed victory requires matching running dungeon, roster and playbooks", () => {
+test("observed victory only validates matching running dungeon, roster and playbooks", () => {
   const harder = { ...fixture.dungeons[0], id: "D109", unlockedBy: "D401",
     hp: 100000, pow: 100000 };
   const data = { ...fixture, dungeons: [...fixture.dungeons, harder] };
@@ -197,12 +221,20 @@ test("observed victory requires matching running dungeon, roster and playbooks",
   ] } };
   const first = (state) => analyze(state, data).adventure.areas[0];
   assert.equal(first(progress).id, "D109");
+  assert.equal(first(progress).validated, true);
   const replace = (change) => ({ ...progress, d: { dungeons:
     progress.d.dungeons.map((state) => state.id === "D109" ? { ...state, ...change } : state) } });
-  assert.equal(first(replace({ floor: 1 })).id, "D101");
-  assert.equal(first(replace({ party: { heroID: ["H0", "H0", "H2", "H3"] } })).id, "D101");
-  assert.equal(first(replace({ lastPlaybook: ["PB2", "PB1", "PB1", "PB1"] })).id, "D101");
-  assert.equal(first(replace({ id: "D108" })).id, "D101");
+  assert.equal(first(replace({ floor: 1 })).id, "D109");
+  assert.equal(first(replace({ floor: 1 })).validated, false);
+  assert.equal(first(replace({ party: { heroID: ["H0", "H0", "H2", "H3"] } })).validated, false);
+  assert.equal(first(replace({ lastPlaybook: ["PB2", "PB1", "PB1", "PB1"] })).validated, false);
+  const runningElsewhere = { ...progress, d: { dungeons: [
+    ...progress.d.dungeons.map((state) =>
+      state.id === "D109" ? { ...state, status: 0 } : state),
+    { ...run, id: "D108" }
+  ] } };
+  assert.equal(first(runningElsewhere).id, "D109");
+  assert.equal(first(runningElsewhere).validated, false);
 });
 
 test("live analysis restarts on team changes and reads newest non-team values", async () => {
@@ -222,12 +254,12 @@ test("live analysis restarts on team changes and reads newest non-team values", 
   assert.equal(result.save, live);
 });
 
-test("no simulated first-floor victory means no actionable party", () => {
+test("no simulated first-floor victory still recommends the highest tiers without validation", () => {
   const data = { ...fixture, dungeons: fixture.dungeons.map((dungeon) =>
     ({ ...dungeon, pow: 1e6, hp: 1e6 })) };
   const plan = analyze(save, data).adventure;
-  assert.equal(plan.areas.length, 0);
-  assert.match(plan.reason, /首层/);
+  assert.deepEqual(plan.areas.map((area) => area.id), ["D101", "D201", "D301"]);
+  assert.ok(plan.areas.every((area) => !area.validated && area.simulation.floors === 0));
 });
 
 test("ghost-area phase and evasion cost additional simulated turns", () => {
