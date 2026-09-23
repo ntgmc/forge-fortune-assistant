@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Forge & Fortune 战力助手
 // @namespace    https://game.itwmw.com/forge-fortune/
-// @version      3.2.0
+// @version      3.2.1
 // @description  分析战力并可选自动精通、编队技能与融合
 // @match        https://game.itwmw.com/forge-fortune/*
 // @grant        none
@@ -26,6 +26,39 @@
     };
   }
 
+  const EQUIPMENT_SERIES = {
+    Swords: "blood", Knives: "blood", Thrown: "blood",
+    Gauntlets: "assault", Rings: "assault", Masks: "assault",
+    Armor: "guardian", Helmets: "guardian", Shields: "guardian"
+  };
+  function dungeonEquipmentEffects(gear, recipes) {
+    const combat = { leech: 0, normal: 0, guard: 0, guardianLow: 0, unique: {} };
+    for (const item of gear) {
+      const recipe = recipes.get(item?.id);
+      if (!recipe || !Number.isInteger(item?.rarity) || item.rarity < 4 || item.rarity > 6) continue;
+      let series = EQUIPMENT_SERIES[recipe.type];
+      if (recipe.type === "Trinkets" && /^R901\d{2}$/.test(item.id)) {
+        series = "assault";
+      }
+      if (!series) continue;
+      if (item.rarity === 6 && !combat.unique[series]) {
+        combat.unique[series] = true;
+      }
+      if (series === "blood") combat.leech += item.rarity === 4 ? 0.03 : 0.05;
+      if (series === "assault") combat.normal += item.rarity === 4 ? 0.1 : 0.15;
+      if (series === "guardian") {
+        combat.guard += item.rarity === 4 ? 0.05 : 0.08;
+        if (item.rarity >= 5) combat.guardianLow += 0.02;
+      }
+    }
+    return {
+      ...combat,
+      leech: Math.min(0.08, combat.leech),
+      normal: Math.min(0.3, combat.normal),
+      guard: Math.min(0.15, combat.guard)
+    };
+  }
+
   function heroesFromSave(save, data) {
     const recipes = indexById(data.recipes);
     const heroDefs = indexById(data.heroes);
@@ -38,6 +71,7 @@
         id: hero.id, name: info.name, info, gear, playbook: hero.playbook,
         pow: info.initialPow + sum(stats.map((stat) => stat.pow)),
         hp: info.initialHP + sum(stats.map((stat) => stat.hp)),
+        combat: dungeonEquipmentEffects(gear, recipes),
         currentHp: hero.hp
       };
     }).filter(Boolean);
@@ -234,7 +268,7 @@
   ]);
 
   // Bounded deterministic combat projection: the game has additional random, rune and equipment effects.
-  function simulateFloor(profiles, def, mobDefs, skills, floor, pressure = 1) {
+  function simulateFloor(profiles, def, mobDefs, skills, floor, pressure = 1, usedGuardians = new Set()) {
     if (!mobDefs?.length || mobDefs.some((mob) => !mob ||
       [mob.skill1, mob.skill2, mob.skill3, mob.skill4].some((id) =>
         !PROJECTED_ENEMY_SKILLS.has(id) || !skills.has(id))) ||
@@ -249,6 +283,9 @@
     }));
     const heroes = profiles.map((profile) => ({
       hp: profile.hero.hp, maxHp: profile.hero.hp, pow: profile.hero.pow, healingPenalty: 1,
+      equipment: profile.hero.combat || {}, attacks: 0, normals: 0,
+      guardianUsed: usedGuardians.has(profile.hero.id ?? profile.hero),
+      id: profile.hero.id ?? profile.hero,
       skills: [profile.book.skill1, profile.book.skill2, profile.book.skill3, profile.book.skill4]
     }));
     let turns = 0;
@@ -280,12 +317,33 @@
             const alive = enemies.filter((enemy) => enemy.hp > 0);
             const count = /所有敌人|全体敌人/.test(text) ? alive.length :
               /两名敌人|两个敌人/.test(text) ? Math.min(2, alive.length) : 1;
+            let dealt = 0;
+            let lastTarget = null;
             for (const enemy of alive.slice(0, count)) {
               if (enemy.phase) continue;
               if (enemy.evade > 0) { enemy.evade--; continue; }
+              const before = enemy.hp;
               enemy.hp = Math.max(0, enemy.hp -
                 Math.floor(power * (effect.frontFactor || 1) * (1 + damageBuff) *
+                  (1 + (id === "S0000" ? num(hero.equipment.normal) : 0)) *
                   (1 - enemy.protection)));
+              dealt += before - enemy.hp;
+              lastTarget = enemy;
+            }
+            if (dealt > 0) {
+              hero.attacks++;
+              hero.hp = Math.min(hero.maxHp, hero.hp +
+                Math.floor(Math.min(dealt * num(hero.equipment.leech), hero.maxHp * 0.05)));
+              if (hero.equipment.unique?.blood && hero.attacks % 3 === 0) {
+                hero.hp = Math.min(hero.maxHp, hero.hp + Math.floor(hero.maxHp * 0.05));
+              }
+              if (id === "S0000") {
+                hero.normals++;
+                if (hero.equipment.unique?.assault && hero.normals % 3 === 0 && lastTarget?.hp > 0) {
+                  lastTarget.hp = Math.max(0, lastTarget.hp - Math.floor(hero.pow * 0.3 *
+                    (1 - lastTarget.protection)));
+                }
+              }
             }
           }
         }
@@ -334,8 +392,19 @@
               Math.floor(power * (skill.mod2 || 1.5));
             if (id === "SM301") power = Math.floor(
               targets[0]?.maxHp * (skill.mod1 || 0.2));
-            for (const target of targets) target.hp = Math.max(0, target.hp -
-              Math.floor(power * (1 - Math.min(0.8, guard))));
+              for (const target of targets) {
+                const equipmentGuard = Math.min(0.15, num(target.equipment.guard) +
+                  (target.hp < target.maxHp * 0.4 ? num(target.equipment.guardianLow) : 0));
+                const damage = Math.floor(power * (1 - Math.min(0.8, guard)) *
+                  (1 - equipmentGuard));
+                if (target.equipment.unique?.guardian && !target.guardianUsed && damage >= target.hp) {
+                  target.guardianUsed = true;
+                  usedGuardians.add(target.id);
+                  target.hp = 1;
+                } else {
+                  target.hp = Math.max(0, target.hp - damage);
+                }
+              }
             if (id === "SM102" && targets[0]) targets[0].healingPenalty = 0.5;
             if (id === "SM100") for (const ally of enemies) {
               if (ally.hp > 0) ally.hp = Math.min(ally.maxHp, ally.hp + power);
@@ -364,8 +433,9 @@
     let floors = 0;
     let last = null;
     let lastVictory = null;
+    const usedGuardians = new Set();
     for (let floor = 1; floor <= limit; floor++) {
-      last = simulateFloor(ordered, def, mobDefs, skills, floor);
+      last = simulateFloor(ordered, def, mobDefs, skills, floor, 1, usedGuardians);
       if (!last?.cleared) break;
       floors++;
       lastVictory = last;
@@ -587,11 +657,12 @@
   }
 
   function adventureWorkerSource() {
-    const helpers = [indexById, sum, num, itemStats, heroesFromSave, bookProfile,
+    const helpers = [indexById, sum, num, itemStats, dungeonEquipmentEffects, heroesFromSave, bookProfile,
       skillOptions, partyScore, bestBooks, combinations, simulateFloor,
       simulateDungeon, passesSafetyFloor, improveSimulatedBooks,
       adventureFingerprint, compareAdventureTeams, adventureAdvice];
-    return `const EFFECTS = ${JSON.stringify(EFFECTS)};
+    return `const EQUIPMENT_SERIES = ${JSON.stringify(EQUIPMENT_SERIES)};
+      const EFFECTS = ${JSON.stringify(EFFECTS)};
       const PROJECTED_ENEMY_SKILLS = new Set(${JSON.stringify([...PROJECTED_ENEMY_SKILLS])});
       ${helpers.map((helper, index) => index < 3
         ? `const ${helper.name} = ${helper.toString()};` : helper.toString()).join("\n")}
@@ -1232,7 +1303,9 @@
         const members = [area.front, ...area.members.filter((hero) => hero !== area.front)];
           section(`${area.name} · ${area.id} · ${area.observed ? "当前队伍实战已过首层" :
             area.validated ? `预计通过 ${area.simulation.floors} 层（最多模拟 20 层）` :
-              `首层未验证${area.simulation.floors ? ` · 基础模拟通过 ${area.simulation.floors} 层` : ""}`}`, [
+              !area.simulation.complete ? "战斗数据或敌方技能无法完整模拟" :
+                area.simulation.floors ? `基础模拟通过 ${area.simulation.floors} 层 · 首层压力测试未通过` :
+                  "首层基础模拟未通过"}`, [
             [`${area.running ? `正在进行 ${area.running.id}，下次出发推荐` : "出发推荐"}：${members.map((hero) => hero.name).join(" → ")}`, "positive"],
           [`较当前队伍需换入：${area.changed.map((hero) => hero.name).join("、") || "无"}`, ""],
           [`前排集火 ${formatted(area.focus)} · 多目标溢出伤害 ${formatted(area.spread)} · 估计敌方压力 ${formatted(area.pressure)}`, "muted"],

@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
 const vm = require("node:vm");
-const { analyze, itemStats, boostAdvice, bestBooks, equipmentAdvice, partyScore,
+const { analyze, itemStats, heroesFromSave, boostAdvice, bestBooks, equipmentAdvice, partyScore,
   freeMastery, fusionCandidates, fusionBorrowCandidates, fusionUpgradeStep,
   fusionHasSlot, nextPartyMove,
   schedulePlaybookDialogClose, simulateDungeon, simulateFloor, passesSafetyFloor,
@@ -76,6 +76,86 @@ fixture.heroes = Array.from({ length: 12 }, (_, i) => ({
 test("equipment stats use rarity, sharpness and transformed attributes", () => {
   assert.deepEqual(itemStats({ rarity: 1, sharp: 2, powRatio: 0, hpRatio: 3 },
     fixture.recipes[0], fixture.misc.rarityMod), { pow: 0, hp: 594 });
+});
+
+test("rare dungeon equipment does not grant expedition stats and deduplicates unique effects", () => {
+  const types = ["Swords", "Gauntlets", "Armor", "Helmets"];
+  const rarities = [5, 6, 6, 6];
+  const recipes = types.map((type, i) => ({ ...basicRecipe(`E${i}`, 0), type }));
+  const data = {
+    ...fixture, recipes,
+    heroes: [{ ...fixture.heroes[0], initialPow: 1000, initialHP: 10000 }]
+  };
+  const progress = {
+    h: { heroes: [{
+      id: "H0", owned: true, hp: 1, playbook: "PB1",
+      gearSlots: rarities.map((rarity, i) => ({ gear: { id: `E${i}`, rarity } }))
+    }] }
+  };
+  const [hero] = heroesFromSave(progress, data);
+  assert.equal(hero.pow, 1000);
+  assert.equal(hero.hp, 10000);
+  assert.equal(hero.currentHp, 1);
+  assert.deepEqual(hero.combat.unique, { assault: true, guardian: true });
+  assert.equal(hero.combat.leech, 0.05);
+  assert.equal(hero.combat.normal, 0.15);
+  assert.equal(hero.combat.guard, 0.15);
+  const withAnotherGuardian = {
+    ...progress, h: { heroes: [{
+      ...progress.h.heroes[0],
+      gearSlots: [...progress.h.heroes[0].gearSlots,
+        { gear: { id: "E3", rarity: 6 } }]
+    }] }
+  };
+  const [again] = heroesFromSave(withAnotherGuardian, data);
+  assert.equal(again.hp, 10000);
+  assert.deepEqual(again.combat.unique, hero.combat.unique);
+  assert.equal(again.combat.guard, 0.15);
+});
+
+test("equipment hit effects and once-per-adventure guardian change floor outcomes", () => {
+  const skills = new Map([["S0000", { powMod: 1 }]]);
+  const mob = { hpMod: 1, powMod: 1,
+    skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000" };
+  const profile = (combat, pow = 100, hp = 100) => ({
+    hero: { id: "H0", pow, hp, combat },
+    book: { skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000" }
+  });
+  const attack = { hp: 360, pow: 0 };
+  const baseline = simulateFloor([profile({ normal: 0.1 })], attack, [mob], skills, 1);
+  const assault = simulateFloor([profile({ normal: 0.1, unique: { assault: true } })],
+    attack, [mob], skills, 1);
+  assert.equal(baseline.cleared, true);
+  assert.equal(assault.cleared, true);
+  assert.ok(assault.turns < baseline.turns);
+  const sustain = { hp: 400, pow: 20 };
+  const plain = simulateFloor([profile({})], sustain, [mob], skills, 1);
+  const blood = simulateFloor([profile({ leech: 0.05, unique: { blood: true } })],
+    sustain, [mob], skills, 1);
+  assert.ok(blood.remaining > plain.remaining);
+  const guardian = profile({ guard: 0.08, unique: { guardian: true } }, 1, 50);
+  const used = new Set();
+  simulateFloor([guardian], { hp: 500, pow: 100 }, [mob], skills, 1, 1, used);
+  assert.equal(used.has("H0"), true);
+  const nextFloor = simulateFloor([guardian], { hp: 500, pow: 100 }, [mob], skills, 2, 1, used);
+  assert.equal(nextFloor.cleared, false);
+  assert.equal(nextFloor.turns, 2);
+});
+
+test("dungeon guardian can turn a failed first-floor pressure test into a pass", () => {
+  const skills = new Map([["S0000", { powMod: 1 }]]);
+  const mob = { hpMod: 1, powMod: 1,
+    skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000" };
+  const def = { mob1: "B1", hp: 100, pow: 80 };
+  const mobs = new Map([["B1", mob]]);
+  const profile = {
+    hero: { id: "H0", pow: 100, hp: 80 },
+    book: { skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000" }
+  };
+  assert.equal(passesSafetyFloor([profile], def, mobs, skills), false);
+  assert.equal(passesSafetyFloor([{
+    ...profile, hero: { ...profile.hero, combat: { unique: { guardian: true } } }
+  }], def, mobs, skills), true);
 });
 
 test("boost plan chooses the fastest unlocked tier sustainable for its stated horizon", () => {
@@ -372,14 +452,19 @@ test("ghost-area falling rocks halve party HP rather than do nothing", () => {
 });
 
 test("worker combat search matches main-thread result", () => {
+  const equipped = {
+    ...save, h: { heroes: save.h.heroes.map((hero, i) => i ? hero : {
+      ...hero, gearSlots: [{ gear: { id: "R1", rarity: 6, sharp: 0 } }]
+    }) }
+  };
   let response;
   const context = { self: { postMessage: (message) => { response = message; } } };
   vm.runInNewContext(adventureWorkerSource(), context);
-  context.self.onmessage({ data: { save, config: fixture } });
+  context.self.onmessage({ data: { save: equipped, config: fixture } });
   assert.equal(response.error, undefined);
   assert.deepEqual(JSON.parse(JSON.stringify(response.result.areas.map((area) =>
     [area.id, area.simulation.floors, area.members.map((hero) => hero.id)]))),
-  analyze(save, fixture).adventure.areas.map((area) =>
+  analyze(equipped, fixture).adventure.areas.map((area) =>
     [area.id, area.simulation.floors, area.members.map((hero) => hero.id)]));
 });
 
