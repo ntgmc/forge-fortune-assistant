@@ -5,7 +5,8 @@ const path = require("node:path");
 const zlib = require("node:zlib");
 const vm = require("node:vm");
 const { analyze, itemStats, boostAdvice, bestBooks, equipmentAdvice, partyScore,
-  freeMastery, fusionCandidates, fusionHasSlot, nextPartyMove,
+  freeMastery, fusionCandidates, fusionBorrowCandidates, fusionUpgradeStep,
+  fusionHasSlot, nextPartyMove,
   schedulePlaybookDialogClose, simulateDungeon, simulateFloor, adventureWorkerSource,
   adventureFingerprint, analyzeLiveSave } =
   require("../forge-fortune-assistant.user.js");
@@ -360,6 +361,70 @@ test("fusion waits for an unlocked empty slot", () => {
     sh: { perks: [{ id: "AL3006", purchased: true }] } }), true);
   assert.equal(fusionHasSlot({ ...save, fb: { slots: [...slots, {}] },
     sh: { perks: [{ id: "AL3006", purchased: true }] } }), false);
+});
+test("fusion borrows exactly one matching equipped item from an idle hero", () => {
+  const data = { ...fixture, recipes: fixture.recipes.map((recipe) =>
+    ({ ...recipe, recipeType: "normal", value: 10 })) };
+  const gear = { id: "R1", rarity: 1, sharp: 0, rune: 0, powRatio: 3, hpRatio: 0 };
+  const progress = { ...save,
+    h: { heroes: save.h.heroes.map((hero, index) => index === 0 ?
+      { ...hero, gearSlots: [{ gear }] } : hero) },
+    d: { dungeons: save.d.dungeons.map((dungeon) => ({ ...dungeon, status: 0 })) },
+    i: [{ ...gear, qty: 2 }], rs: [{ id: "M001", amt: 80 }], fb: { slots: [] }
+  };
+  const candidate = fusionBorrowCandidates(progress, data);
+  assert.deepEqual(candidate, [{
+    heroId: "H0", slotIndex: 0, gearType: "Swords", id: "R1", rarity: 1,
+    uniqueID: "R1_1_0_0_0", outputID: "R1_2_0_0_0", outputQty: 0
+  }]);
+  assert.equal(fusionUpgradeStep(progress, data, { ...candidate[0], stage: "unequip" }), "unequip");
+  assert.deepEqual(fusionBorrowCandidates({
+    ...progress, d: save.d
+  }, data), []);
+  assert.deepEqual(fusionBorrowCandidates({
+    ...progress, h: { heroes: progress.h.heroes.map((hero, index) =>
+      index === 0 ? { ...hero, gearSlots: [{ gear: { ...gear, sharp: 1 } }] } : hero) }
+  }, data), []);
+  assert.deepEqual(fusionBorrowCandidates({
+    ...progress, rs: [{ id: "M001", amt: 79 }]
+  }, data), []);
+  assert.deepEqual(fusionBorrowCandidates({
+    ...progress, fb: { slots: [{}, {}] }
+  }, data), []);
+  assert.deepEqual(fusionBorrowCandidates({
+    ...progress, i: [{ ...gear, qty: 3 }]
+  }, data), []);
+});
+
+test("borrowed fusion waits for save confirmation then equips the new item", () => {
+  const data = { ...fixture, recipes: fixture.recipes.map((recipe) =>
+    ({ ...recipe, recipeType: "normal", value: 10 })) };
+  const gear = { id: "R1", rarity: 1, sharp: 0, rune: 0, powRatio: 3, hpRatio: 0 };
+  const withGear = (item) => ({ ...save, h: { heroes: save.h.heroes.map((hero, index) =>
+    index === 0 ? { ...hero, gearSlots: [{ gear: item }] } : hero) },
+  d: { dungeons: save.d.dungeons.map((dungeon) => ({ ...dungeon, status: 0 })) },
+  rs: [{ id: "M001", amt: 80 }], fb: { slots: [] } });
+  const equipped = { ...withGear(gear), i: [{ ...gear, qty: 2 }] };
+  const plan = { ...fusionBorrowCandidates(equipped, data)[0], startedAt: Date.now() };
+  assert.equal(fusionUpgradeStep(equipped, data, { ...plan, stage: "start" }), "wait");
+  const removed = { ...withGear(null), i: [{ ...gear, qty: 3 }] };
+  assert.equal(fusionUpgradeStep(removed, data, { ...plan, stage: "start" }), "start");
+  const fusing = { ...removed, i: [], fb: { slots: [{ uniqueID: plan.outputID }] } };
+  assert.equal(fusionUpgradeStep(fusing, data, { ...plan, stage: "fusing" }), "wait");
+  assert.equal(fusionUpgradeStep({ ...removed, i: [{ ...gear, rarity: 2, qty: 1 }] },
+    data, { ...plan, outputQty: 1, stage: "fusing" }), "wait");
+  const output = { ...withGear(null), i: [{ ...gear, rarity: 2, qty: 1 }] };
+  assert.equal(fusionUpgradeStep(output, data, { ...plan, stage: "fusing" }), "equip");
+  assert.equal(fusionUpgradeStep(output, data, { ...plan, stage: "equip" }), "equip");
+  assert.equal(fusionUpgradeStep({ ...output, i: [{ ...gear, rarity: 2, qty: 2 }] },
+    data, { ...plan, outputQty: 1, stage: "fusing" }), "equip");
+  assert.equal(fusionUpgradeStep({ ...withGear({ ...gear, rarity: 2 }), i: [] },
+    data, { ...plan, stage: "equip" }), "complete");
+  assert.equal(fusionUpgradeStep({ ...removed, rs: [{ id: "M001", amt: 0 }] },
+    data, { ...plan, stage: "start" }), "restore");
+  assert.equal(fusionUpgradeStep(removed, data, { ...plan, stage: "restore" }), "restore");
+  assert.equal(fusionUpgradeStep(output, data, { ...plan, stage: "restore" }), "equip");
+  assert.equal(fusionUpgradeStep(equipped, data, { ...plan, stage: "restore" }), "complete");
 });
 
 test("party changes proceed one rerender at a time and retain matching prefix", () => {

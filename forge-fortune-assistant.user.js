@@ -701,6 +701,98 @@
       ) ? "1" : "0"}`
     }));
   }
+  function fusionUniqueID(item, recipe) {
+    return `${item.id}_${item.rarity}_${item.sharp}_${item.rune}_${
+      item.powRatio !== recipe.pow || item.hpRatio !== recipe.hp ? "1" : "0"}`;
+  }
+  function fusionBorrowCandidates(save, data) {
+    if (!fusionHasSlot(save)) return [];
+    const recipes = indexById(data.recipes);
+    const heroes = indexById(data.heroes);
+    const gold = (save.rs || []).find((resource) => resource.id === "M001")?.amt || 0;
+    const occupied = new Set((save.d?.dungeons || []).filter((dungeon) => dungeon.status === 1)
+      .flatMap((dungeon) => dungeon.party?.heroID || []));
+    const inventory = (save.i || []).filter((item) => item.qty === 2).map((item) => {
+      const recipe = recipes.get(item.id);
+      if (!recipe || recipe.recipeType !== "normal" || recipe.type === "Trinkets" ||
+          item.rarity >= data.misc.rarityMod.length - 1 || !Number.isFinite(recipe.value) ||
+          gold < 4 * recipe.value * (item.rarity + 1)) return null;
+      const uniqueID = fusionUniqueID(item, recipe);
+      const outputID = fusionUniqueID({ ...item, rarity: item.rarity + 1 }, recipe);
+      if ((save.fb?.slots || []).some((slot) => slot.uniqueID === outputID)) return null;
+      return { item, recipe, uniqueID, outputID };
+    }).filter(Boolean);
+    return (save.h?.heroes || []).filter((hero) => hero.owned && !occupied.has(hero.id))
+      .flatMap((hero) => (hero.gearSlots || []).flatMap((slot, slotIndex) => {
+        const gear = slot.gear;
+        const gearType = heroes.get(hero.id)?.[`slot${slotIndex + 1}Type`];
+        if (!gear || !gearType) return [];
+        const match = inventory.find(({ item, recipe, uniqueID }) =>
+          recipe.type === gearType && item.id === gear.id &&
+          uniqueID === fusionUniqueID(gear, recipe));
+        if (!match) return [];
+        return [{
+          heroId: hero.id, slotIndex, gearType, id: gear.id, rarity: gear.rarity,
+          uniqueID: match.uniqueID, outputID: match.outputID,
+          outputQty: (save.i || []).filter((item) =>
+            item.id === gear.id && fusionUniqueID(item, match.recipe) === match.outputID)
+            .reduce((total, item) => total + item.qty, 0)
+        }];
+      }));
+  }
+  function fusionUpgradeStep(save, data, plan) {
+    const hero = (save.h?.heroes || []).find((entry) => entry.id === plan.heroId);
+    const recipe = indexById(data.recipes).get(plan.id);
+    const heroInfo = indexById(data.heroes).get(plan.heroId);
+    if (!hero?.owned || !recipe || !hero.gearSlots?.[plan.slotIndex] ||
+        heroInfo?.[`slot${plan.slotIndex + 1}Type`] !== plan.gearType ||
+        recipe.type !== plan.gearType) return "abort";
+    const gear = hero.gearSlots[plan.slotIndex].gear;
+    const equipped = gear && fusionUniqueID(gear, recipe);
+    const stock = (uniqueID) => (save.i || []).reduce((total, item) =>
+      item.id === plan.id && fusionUniqueID(item, recipe) === uniqueID ?
+        total + item.qty : total, 0);
+    const input = stock(plan.uniqueID);
+    const output = stock(plan.outputID);
+    const inFusion = (save.fb?.slots || []).some((slot) => slot.uniqueID === plan.outputID);
+    const occupied = (save.d?.dungeons || []).some((dungeon) =>
+      dungeon.status === 1 && dungeon.party?.heroID?.includes(plan.heroId));
+    if (plan.stage === "unequip") {
+      if (equipped === plan.uniqueID) return occupied ? "wait" : "unequip";
+      if (gear) return "abort";
+      return input >= 3 ? "start" : "restore";
+    }
+    if (plan.stage === "start") {
+      if (equipped === plan.uniqueID) return Date.now() - plan.startedAt > 15000 ?
+        "restore" : "wait";
+      if (gear) return "abort";
+      if (output > plan.outputQty && !inFusion) return "equip";
+      if (occupied) return "restore";
+      if (input < 3) return inFusion ? "fusing" :
+        Date.now() - plan.startedAt > 15000 ? "restore" : "wait";
+      const gold = (save.rs || []).find((resource) => resource.id === "M001")?.amt || 0;
+      return fusionHasSlot(save) && gold >= 4 * recipe.value * (plan.rarity + 1) ?
+        "start" : "restore";
+    }
+    if (plan.stage === "fusing") {
+      if (gear) return "abort";
+      if (output > plan.outputQty && !inFusion) return "equip";
+      if (input >= 3 && !inFusion && Date.now() - plan.startedAt > 30000) return "restore";
+      return "wait";
+    }
+    if (plan.stage === "equip") {
+      if (equipped === plan.outputID) return "complete";
+      if (gear) return "abort";
+      return output > plan.outputQty && !occupied ? "equip" : "wait";
+    }
+    if (plan.stage === "restore") {
+      if (equipped === plan.uniqueID) return "complete";
+      if (gear) return "abort";
+      if (output > plan.outputQty && !inFusion) return "equip";
+      return input > 0 && !occupied ? "restore" : "wait";
+    }
+    return "abort";
+  }
 
   function fusionHasSlot(save) {
     const perks = new Set((save.sh?.perks || []).filter((perk) => perk.purchased)
@@ -733,7 +825,8 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = { itemStats, heroesFromSave, boostAdvice, adventureAdvice,
       skillAdvice, equipmentAdvice, analyze, partyScore, bestBooks, freeMastery,
-      fusionCandidates, fusionHasSlot, nextPartyMove, schedulePlaybookDialogClose,
+      fusionCandidates, fusionBorrowCandidates, fusionUpgradeStep, fusionHasSlot,
+      nextPartyMove, schedulePlaybookDialogClose,
       simulateDungeon, simulateFloor, adventureWorkerSource, adventureFingerprint, analyzeLiveSave };
   }
   if (typeof document === "undefined" || !location.pathname.startsWith("/forge-fortune")) return;
@@ -842,12 +935,119 @@
   let pendingAdventure = null;
   const attemptedMastery = new Set();
   const attemptedFusion = new Set();
+  const fusionPlanKey = "ffa-fusion-upgrade-v1";
   const visible = (element) => element && element.getClientRects().length > 0;
   const gameData = (element, key) => window.jQuery?.(element).data(key);
   const action = (message) => {
     actionStatus.className = "status";
     actionStatus.textContent = message;
   };
+  function showFusionHero(heroId) {
+    const selected = document.querySelector(".previewCardHero .heroOwnedCard");
+    if (!visible(selected) || selected.getAttribute("data-value") !== heroId) {
+      const heroTab = document.querySelector("#heroesTabLink");
+      const card = [...document.querySelectorAll(
+        `#heroList .heroInspect[data-value="${heroId}"], ` +
+        `#overviewContainer .heroInspect[data-value="${heroId}"]`
+      )].find(visible);
+      if (visible(card)) card.click();
+      else if (visible(heroTab)) heroTab.click();
+      return false;
+    }
+    const equipmentTab = [...document.querySelectorAll("#heroInspectIndividual .heroTab")]
+      .find((tab) => tab.getAttribute("data-herotabid") === "Equipment");
+    if (!equipmentTab?.classList.contains("selected")) {
+      if (visible(equipmentTab)) equipmentTab.click();
+      return false;
+    }
+    return true;
+  }
+  function showFusionBuilding() {
+    if (visible(document.querySelector("#fuseList"))) return true;
+    const building = document.querySelector("#fusionBldg");
+    if (visible(building)) building.click();
+    else document.querySelector("#townTabLink")?.click();
+    return false;
+  }
+  function runFusionUpgrade(save) {
+    const stored = localStorage.getItem(fusionPlanKey);
+    if (!stored) return false;
+    let plan;
+    try {
+      plan = JSON.parse(stored);
+    } catch {
+      localStorage.removeItem(fusionPlanKey);
+      return false;
+    }
+    if (!plan || !["unequip", "start", "fusing", "equip", "restore"].includes(plan.stage) ||
+        !/^[A-Za-z0-9]+$/.test(plan.heroId) || !Number.isInteger(plan.slotIndex) ||
+        !Number.isInteger(plan.outputQty) || plan.outputQty < 0 ||
+        typeof plan.id !== "string" || typeof plan.gearType !== "string" ||
+        typeof plan.uniqueID !== "string" || typeof plan.outputID !== "string") {
+      localStorage.removeItem(fusionPlanKey);
+      return false;
+    }
+    if (!automation.fusion.checked) {
+      if (plan.stage === "unequip" || (plan.stage === "start" &&
+          (!save.h?.heroes?.find((hero) => hero.id === plan.heroId)
+            ?.gearSlots?.[plan.slotIndex]?.gear ||
+            Date.now() - plan.startedAt > 15000))) {
+        plan.stage = "restore";
+      }
+    }
+    let step = fusionUpgradeStep(save, config, plan);
+    if (step === "complete" || step === "abort") {
+      localStorage.removeItem(fusionPlanKey);
+      action(step === "complete" ? `${plan.heroId}：装备已恢复或完成融合升级。` :
+        `${plan.heroId}：装备状态改变，已停止自动融合，请手动检查。`);
+      return true;
+    }
+    if (plan.stage === "unequip" && ["start", "restore"].includes(step)) plan.stage = step;
+    if (plan.stage === "start" && ["restore", "fusing", "equip"].includes(step)) plan.stage = step;
+    if (plan.stage === "fusing" && step === "equip") plan.stage = "equip";
+    if (plan.stage === "fusing" && step === "restore") plan.stage = "restore";
+    if (plan.stage === "restore" && step === "equip") plan.stage = "equip";
+    localStorage.setItem(fusionPlanKey, JSON.stringify(plan));
+    if (step === "wait") return true;
+    if (step === "unequip" || step === "equip" || step === "restore") {
+      if (!showFusionHero(plan.heroId)) return true;
+      if (step === "unequip") {
+        const button = [...document.querySelectorAll("#heroGearSlotList .heroUnequipSlot")]
+          .find((entry) => visible(entry) && gameData(entry, "heroID") === plan.heroId &&
+            gameData(entry, "gearType") === plan.gearType);
+        if (!button) return true;
+        plan.stage = "start";
+        plan.startedAt = Date.now();
+        localStorage.setItem(fusionPlanKey, JSON.stringify(plan));
+        button.click();
+        action(`${plan.heroId}：已卸下 ${plan.id}，等待背包确认后开始融合。`);
+        return true;
+      }
+      const uniqueID = step === "equip" ? plan.outputID : plan.uniqueID;
+      const slot = document.querySelectorAll("#heroGearSlotList .heroExamineEquipment")[plan.slotIndex];
+      if (!visible(slot) || !slot.querySelector(".emptyGearSlot")) return true;
+      const item = [...document.querySelectorAll("#heroEquipmentList .gearItem")]
+        .find((entry) => visible(entry) && gameData(entry, "heroID") === plan.heroId &&
+          gameData(entry, "uniqueID") === uniqueID);
+      if (item) {
+        item.click();
+        action(`${plan.heroId}：正在装备${step === "equip" ? "融合升级品" : "原装备"}。`);
+      }
+      return true;
+    }
+    if (step === "start") {
+      if (!showFusionBuilding()) return true;
+      const button = [...document.querySelectorAll("#fuseList .fuseStart")]
+        .find((entry) => visible(entry) && entry.getAttribute("uniqueid") === plan.uniqueID);
+      if (!button) return true;
+      plan.stage = "fusing";
+      plan.startedAt = Date.now();
+      localStorage.setItem(fusionPlanKey, JSON.stringify(plan));
+      button.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true }));
+      action(`${plan.heroId}：正在融合 ${plan.id}，完成后自动装备升级品。`);
+    }
+    return true;
+  }
 
   function applyPartyPlan(save) {
     const teamView = document.querySelector("#areaTeamSelect");
@@ -908,12 +1108,14 @@
   }
 
   function runAutomation() {
-    if (!config || !Object.values(automation).some((input) => input.checked)) return;
+    if (!config || (!localStorage.getItem(fusionPlanKey) &&
+        !Object.values(automation).some((input) => input.checked))) return;
     try {
       if (document.querySelector("#dialogContainer")) return;
       const text = localStorage.getItem("ffgs1");
       if (!text) return;
       const save = parseSave(text);
+      if (runFusionUpgrade(save)) return;
       if (automation.mastery.checked) {
         const eligible = new Set(freeMastery(save, config));
         const button = [...document.querySelectorAll(".recipeMasteryGuildButton, .recipeMasteredStatus")]
@@ -940,6 +1142,16 @@
           attemptedFusion.add(`${item.uniqueID}_${item.qty}`);
           button.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true }));
           action(`已安排融合 ${item.id}（品质 ${item.rarity}），至少保留一件库存。`);
+          return;
+        }
+        if (visible(document.querySelector("#fuseList"))) {
+          const borrowed = fusionBorrowCandidates(save, config)[0];
+          if (borrowed) {
+            localStorage.setItem(fusionPlanKey, JSON.stringify({ ...borrowed,
+              stage: "unequip", startedAt: Date.now() }));
+            action(`${borrowed.heroId}：准备卸下 ${borrowed.id} 融合升级，完成后将重新装备。`);
+            return;
+          }
         }
       }
     } catch (error) {
