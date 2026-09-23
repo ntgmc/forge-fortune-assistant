@@ -7,7 +7,8 @@ const vm = require("node:vm");
 const { analyze, itemStats, boostAdvice, bestBooks, equipmentAdvice, partyScore,
   freeMastery, fusionCandidates, fusionBorrowCandidates, fusionUpgradeStep,
   fusionHasSlot, nextPartyMove,
-  schedulePlaybookDialogClose, simulateDungeon, simulateFloor, adventureWorkerSource,
+  schedulePlaybookDialogClose, simulateDungeon, simulateFloor, passesSafetyFloor,
+  compareAdventureTeams, adventureWorkerSource,
   adventureFingerprint, analyzeLiveSave } =
   require("../forge-fortune-assistant.user.js");
 
@@ -91,6 +92,22 @@ test("joint assignment fills all three areas without duplicating heroes", () => 
   assert.equal(result.skills.length, 12);
   assert.ok(result.adventure.areas.every((area) =>
     area.profiles.every((profile) => profile.book)));
+});
+test("joint allocation prioritizes verified teams then the shallowest region", () => {
+  const teams = (floors, validated = [true, true, true]) => floors.map((floor, index) => ({
+    validated: validated[index], simulation: { floors: floor }, value: floor * 1e6
+  }));
+  assert.equal(compareAdventureTeams(teams([1, 2, 2]), teams([1, 1, 5])), 1);
+  assert.equal(compareAdventureTeams(teams([2, 2, 3]), teams([1, 4, 6])), 1);
+  assert.equal(compareAdventureTeams(teams([1, 1, 1]), teams([0, 8, 8], [false, true, true])), 1);
+  assert.equal(compareAdventureTeams(teams([0, 8, 8], [false, true, true]),
+    teams([1, 1, 1])), -1);
+  assert.equal(compareAdventureTeams(teams([2, 4, 5]), teams([2, 3, 5])), 1);
+  const weak = teams([0, 5, 6], [false, true, true]);
+  const supported = teams([0, 2, 2], [false, true, true]);
+  weak[0].simulation.firstFloorProgress = 0.3;
+  supported[0].simulation.firstFloorProgress = 0.8;
+  assert.equal(compareAdventureTeams(supported, weak), 1);
 });
 
 test("adventure targets highest unlocked tier even when a lower tier is running", () => {
@@ -260,6 +277,15 @@ test("no simulated first-floor victory still recommends the highest tiers withou
   const plan = analyze(save, data).adventure;
   assert.deepEqual(plan.areas.map((area) => area.id), ["D101", "D201", "D301"]);
   assert.ok(plan.areas.every((area) => !area.validated && area.simulation.floors === 0));
+  let response;
+  const context = { self: { postMessage: (message) => { response = message; } } };
+  vm.runInNewContext(adventureWorkerSource(), context);
+  context.self.onmessage({ data: { save, config: data } });
+  assert.equal(response.error, undefined);
+  assert.deepEqual(JSON.parse(JSON.stringify(response.result.areas.map((area) =>
+    [area.id, area.simulation.firstFloorProgress, area.members.map((member) => member.id)]))),
+  plan.areas.map((area) =>
+    [area.id, area.simulation.firstFloorProgress, area.members.map((member) => member.id)]));
 });
 
 test("ghost-area phase and evasion cost additional simulated turns", () => {
@@ -303,6 +329,33 @@ test("first-floor safety rejects a fragile team despite a baseline victory", () 
   const skills = new Map([["S0000", { powMod: 1 }]]);
   assert.equal(simulateFloor([profile], def, [mob], skills, 1).cleared, true);
   assert.equal(simulateFloor([profile], def, [mob], skills, 1, 1.2).cleared, false);
+});
+test("first-floor safety uses five percent pressure, not twenty percent", () => {
+  const profile = { hero: { hp: 50, pow: 70 }, book: {
+    skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000"
+  } };
+  const mob = { id: "B1", hpMod: 1, powMod: 1,
+    skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000" };
+  const dungeon = { mob1: "B1", hp: 130, pow: 40 };
+  const skills = new Map([["S0000", { powMod: 1 }]]);
+  assert.equal(simulateFloor([profile], dungeon, [mob], skills, 1, 1.05).cleared, true);
+  assert.equal(simulateFloor([profile], dungeon, [mob], skills, 1, 1.2).cleared, false);
+  assert.equal(passesSafetyFloor([profile], dungeon, new Map([["B1", mob]]), skills), true);
+});
+test("failed first floor records enemy health reduction for weak-team allocation", () => {
+  const profile = { hero: { hp: 50, pow: 70 }, book: {
+    skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000"
+  } };
+  const mob = { id: "B1", hpMod: 1, powMod: 1,
+    skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000" };
+  const skills = new Map([["S0000", { powMod: 1 }]]);
+  const mobs = new Map([["B1", mob]]);
+  const lighter = simulateDungeon([profile], { mob1: "B1", hp: 150, pow: 60 }, mobs, skills);
+  const heavier = simulateDungeon([profile], { mob1: "B1", hp: 300, pow: 60 }, mobs, skills);
+  assert.equal(lighter.floors, 0);
+  assert.equal(heavier.floors, 0);
+  assert.ok(lighter.firstFloorProgress > heavier.firstFloorProgress);
+  assert.equal(lighter.firstFloorProgress, 70 / 150);
 });
 
 test("ghost-area falling rocks halve party HP rather than do nothing", () => {

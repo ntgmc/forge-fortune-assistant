@@ -343,10 +343,16 @@
             if (id === "SM306") enemy.hp = 0;
           }
         }
-        if (heroes.every((member) => member.hp <= 0)) return { cleared: false, turns, remaining: 0 };
+        if (heroes.every((member) => member.hp <= 0)) return {
+          cleared: false, turns, remaining: 0,
+          enemyRemaining: sum(enemies.map((mob) => mob.hp)),
+          enemyMaxHp: sum(enemies.map((mob) => mob.maxHp))
+        };
       }
     }
-    return { cleared: false, turns, remaining: sum(heroes.map((member) => member.hp)) };
+    return { cleared: false, turns, remaining: sum(heroes.map((member) => member.hp)),
+      enemyRemaining: sum(enemies.map((mob) => mob.hp)),
+      enemyMaxHp: sum(enemies.map((mob) => mob.maxHp)) };
   }
 
   function simulateDungeon(profiles, def, mobs, skills, limit = 20) {
@@ -365,7 +371,9 @@
       lastVictory = last;
     }
     return { floors, remaining: lastVictory?.remaining || 0,
-      turns: lastVictory?.turns || 0, complete: last !== null };
+      turns: lastVictory?.turns || 0, complete: last !== null,
+      firstFloorProgress: floors ? 1 : last?.enemyMaxHp ?
+        Math.min(0.999, Math.max(0, 1 - last.enemyRemaining / last.enemyMaxHp)) : 0 };
   }
 
   function passesSafetyFloor(profiles, def, mobs, skills) {
@@ -375,14 +383,15 @@
     const front = profiles.reduce((best, profile) =>
       profile.hero.hp > best.hero.hp ? profile : best);
     const ordered = [front, ...profiles.filter((profile) => profile !== front)];
-    return simulateFloor(ordered, def, mobDefs, skills, 1, 1.2)?.cleared === true;
+    return simulateFloor(ordered, def, mobDefs, skills, 1, 1.05)?.cleared === true;
   }
 
   function improveSimulatedBooks(save, data, entry, mobs, skills) {
     let profiles = [...entry.profiles];
     let simulation = simulateDungeon(profiles, entry.def, mobs, skills);
     const hp = sum(entry.members.map((member) => member.hp));
-    const fitness = (result, safe) => (safe ? 1e9 : 0) + result.floors * 1e6 +
+    const fitness = (result, safe) => (safe ? 1e9 : 0) +
+      (result.floors || result.firstFloorProgress) * 1e6 +
       result.remaining / Math.max(1, hp) * 100 - result.turns * 0.001;
     let safe = passesSafetyFloor(profiles, entry.def, mobs, skills);
     for (let pass = 0; pass < 2; pass++) {
@@ -422,6 +431,22 @@
         lastPlaybook: state.status === 1 ? state.lastPlaybook : undefined
       }))
     });
+  }
+  function compareAdventureTeams(entries, previous) {
+    if (!previous) return 1;
+    const ranking = (teams) => [
+      sum(teams.map((entry) => Number(entry.validated))),
+      ...teams.map((entry) => entry.simulation.floors ||
+        Math.min(0.999, Math.max(0, entry.simulation.firstFloorProgress || 0)))
+        .sort((a, b) => a - b),
+      sum(teams.map((entry) => entry.value))
+    ];
+    const next = ranking(entries);
+    const current = ranking(previous);
+    for (let index = 0; index < next.length; index++) {
+      if (next[index] !== current[index]) return next[index] > current[index] ? 1 : -1;
+    }
+    return 0;
   }
   async function analyzeLiveSave(readSave, data, project) {
     let save = readSave();
@@ -486,7 +511,8 @@
           const { simulation } = optimized;
           const validated = simulation.complete && simulation.floors >= 1 && optimized.safe;
           const value = (validated ? 1e9 : simulation.complete && simulation.floors >= 1 ? 1e8 : 0) +
-            simulation.floors * 1e6 + Math.max(-1e5, Math.min(1e5, optimized.score));
+            (simulation.floors || simulation.firstFloorProgress) * 1e6 +
+            Math.max(-1e5, Math.min(1e5, optimized.score));
           const result = { ...entry, ...optimized, validated, value };
           if (!results.has(entry.mask) || results.get(entry.mask).value < value) {
             results.set(entry.mask, result);
@@ -546,7 +572,7 @@
         const entries = [first, second, third];
         const progress = sum(entries.map((entry) => entry.simulation.floors));
         const total = first.value + second.value + third.value;
-        if (!optimal || total > optimal.total) {
+        if (compareAdventureTeams(entries, optimal?.entries) > 0) {
           optimal = { progress, total, entries };
         }
       }
@@ -564,7 +590,7 @@
     const helpers = [indexById, sum, num, itemStats, heroesFromSave, bookProfile,
       skillOptions, partyScore, bestBooks, combinations, simulateFloor,
       simulateDungeon, passesSafetyFloor, improveSimulatedBooks,
-      adventureFingerprint, adventureAdvice];
+      adventureFingerprint, compareAdventureTeams, adventureAdvice];
     return `const EFFECTS = ${JSON.stringify(EFFECTS)};
       const PROJECTED_ENEMY_SKILLS = new Set(${JSON.stringify([...PROJECTED_ENEMY_SKILLS])});
       ${helpers.map((helper, index) => index < 3
@@ -824,7 +850,8 @@
       skillAdvice, equipmentAdvice, analyze, partyScore, bestBooks, freeMastery,
       fusionCandidates, fusionBorrowCandidates, fusionUpgradeStep, fusionHasSlot,
       nextPartyMove, schedulePlaybookDialogClose,
-      simulateDungeon, simulateFloor, adventureWorkerSource, adventureFingerprint, analyzeLiveSave };
+      simulateDungeon, simulateFloor, passesSafetyFloor, compareAdventureTeams,
+      adventureWorkerSource, adventureFingerprint, analyzeLiveSave };
   }
   if (typeof document === "undefined" || !location.pathname.startsWith("/forge-fortune")) return;
 
@@ -1199,7 +1226,7 @@
     } else if (tab === 1) {
       const adventure = report.adventure;
         notice(adventure.areas.length
-          ? `三区均按当前最高已解锁难度推荐；${adventure.areas.filter((area) => area.validated).length}/3 处通过首层模拟压力测试或实战验证，模拟合计预计通过 ${adventure.progress} 层。未验证队伍不会自动编队。进行中不能调整技能，调整队伍会重置进度。`
+          ? `三区均按当前最高已解锁难度推荐；先让更多区域通过首层验证，再优先提升最浅区域的预计层数。${adventure.areas.filter((area) => area.validated).length}/3 处通过首层模拟压力测试或实战验证，模拟合计预计通过 ${adventure.progress} 层。未验证队伍不会自动编队。进行中不能调整技能，调整队伍会重置进度。`
           : adventure.reason);
       for (const area of adventure.areas) {
         const members = [area.front, ...area.members.filter((hero) => hero !== area.front)];
@@ -1212,7 +1239,7 @@
           [`治疗约 ${formatted(area.healing)} · 减伤/控场约 ${formatted(area.guards)} · 提前击杀收益约 ${formatted(area.earlyKill)}${area.synergy ? ` · 状态联动约 ${formatted(area.synergy)}` : ""}`, "muted"]
         ]);
       }
-        line(body, "首层压力测试将敌方生命与伤害提高 20%；模型未完整还原装备特效、符文、随机效果和部分状态，仍不保证实际通关。", "status");
+        line(body, "首层压力测试将敌方生命与伤害提高 5%；模型未完整还原装备特效、符文、随机效果和部分状态，仍不保证实际通关。", "status");
     } else if (tab === 2) {
         notice("各区域为下次出发联动选择已解锁技能，并以回合模拟检验队伍；开打后技能无法调整。");
       for (const area of report.adventure.areas) {
