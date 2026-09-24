@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Forge & Fortune 战力助手
 // @namespace    https://game.itwmw.com/forge-fortune/
-// @version      3.3.0
+// @version      3.3.1
 // @description  分析战力并可选后台自动精通、博物馆捐赠、编队技能与融合
 // @match        https://game.itwmw.com/forge-fortune/*
 // @grant        none
@@ -263,8 +263,8 @@
 
   const PROJECTED_ENEMY_SKILLS = new Set([
     "S0000", "SM100", "SM101", "SM102", "SM103", "SM104", "SM105",
-    "SM107", "SM202", "SM203", "SM204", "SM205", "SM207", "SM208",
-    "SM300", "SM301", "SM302", "SM304", "SM305", "SM306", "SM307", "SM308"
+    "SM106", "SM107", "SM109", "SM202", "SM203", "SM204", "SM205", "SM207", "SM208", "SM209",
+    "SM300", "SM301", "SM302", "SM304", "SM305", "SM306", "SM307", "SM308", "SM309"
   ]);
 
   // Bounded deterministic combat projection: the game has additional random, rune and equipment effects.
@@ -279,7 +279,7 @@
       id: mob.id, hp: Math.max(1, Math.floor(baseHp * num(mob.hpMod))),
       maxHp: Math.max(1, Math.floor(baseHp * num(mob.hpMod))),
       pow: Math.floor(basePow * num(mob.powMod)), skills: [mob.skill1, mob.skill2, mob.skill3, mob.skill4],
-      phase: false, evade: 0, protection: 0
+      phase: false, evade: 0, protection: 0, debuffed: false
     }));
     const heroes = profiles.map((profile) => ({
       hp: profile.hero.hp, maxHp: profile.hero.hp, pow: profile.hero.pow, healingPenalty: 1,
@@ -313,6 +313,9 @@
           }
           guard = Math.max(guard, num(effect.guard));
           damageBuff = Math.max(damageBuff, num(effect.attackBuff));
+          if (id === "S2012") {
+            for (const enemy of enemies) if (enemy.hp > 0) enemy.debuffed = true;
+          }
           if (id === "S0000" || /对.*(?:造成|攻击).*伤害/.test(text)) {
             const alive = enemies.filter((enemy) => enemy.hp > 0);
             const count = /所有敌人|全体敌人/.test(text) ? alive.length :
@@ -329,6 +332,8 @@
                   (1 - enemy.protection)));
               dealt += before - enemy.hp;
               lastTarget = enemy;
+              if (effect.chill || effect.scorch || effect.necrosis ||
+                  effect.vulnerability || effect.mark) enemy.debuffed = true;
             }
             if (dealt > 0) {
               hero.attacks++;
@@ -365,6 +370,13 @@
           }
         } else if (id === "SM208") {
           for (const ally of enemies) if (ally.hp > 0) ally.evade++;
+        } else if (id === "SM106") {
+          for (const ally of enemies) {
+            if (ally.hp > 0 && ally.debuffed) {
+              ally.hp = Math.min(ally.maxHp, ally.hp + power);
+              ally.debuffed = false;
+            }
+          }
         } else if (["SM101", "SM105", "SM203", "SM308"].includes(id)) {
           const alive = enemies.filter((ally) => ally.hp > 0);
           const target = id === "SM203" ?
@@ -375,8 +387,8 @@
           if (target?.hp > 0) target.hp = Math.min(target.maxHp, target.hp + power);
         } else {
           const alive = heroes.filter((member) => member.hp > 0);
-          const targets = ["SM204", "SM306"].includes(id) ? alive :
-            id === "SM302" ? alive.slice(-1) :
+          const targets = ["SM204", "SM209", "SM306", "SM309"].includes(id) ? alive :
+            ["SM109", "SM302"].includes(id) ? alive.slice(-1) :
             id === "SM307" ? [alive.reduce((lowest, member) =>
               member.hp < lowest.hp ? member : lowest)] : alive.slice(0, 1);
           if (id === "SM207") {
@@ -388,14 +400,20 @@
             if (id === "SM104") power = Math.floor(power * (skill.mod1 || 2));
             if (id === "SM107" && enemy.hp < enemy.maxHp) power =
               Math.floor(power * (skill.mod2 || 3));
+            if (id === "SM109" && enemy.hp === enemy.maxHp) power =
+              Math.floor(power * (skill.mod2 || 3));
+            if (id === "SM309" && enemy.hp < enemy.maxHp) power =
+              Math.floor(power * (skill.mod1 || 2));
             if (id === "SM202" && targets[0]?.hp < targets[0]?.maxHp * 0.5) power =
               Math.floor(power * (skill.mod2 || 1.5));
             if (id === "SM301") power = Math.floor(
               targets[0]?.maxHp * (skill.mod1 || 0.2));
               for (const target of targets) {
+                const targetPower = id === "SM209" && target.hp === target.maxHp ?
+                  Math.floor(power * (skill.mod1 || 2)) : power;
                 const equipmentGuard = Math.min(0.15, num(target.equipment.guard) +
                   (target.hp < target.maxHp * 0.4 ? num(target.equipment.guardianLow) : 0));
-                const damage = Math.floor(power * (1 - Math.min(0.8, guard)) *
+                const damage = Math.floor(targetPower * (1 - Math.min(0.8, guard)) *
                   (1 - equipmentGuard));
                 if (target.equipment.unique?.guardian && !target.guardianUsed && damage >= target.hp) {
                   target.guardianUsed = true;

@@ -390,6 +390,95 @@ test("ghost-area phase and evasion cost additional simulated turns", () => {
   assert.ok(simulateFloor([profile], def, evasive, skills, 1).turns > direct.turns);
 });
 
+test("X-tier enemy skills target the right heroes and apply conditional damage", () => {
+  const skills = new Map([
+    ["S0000", { powMod: 1 }],
+    ["SM109", { powMod: 1, mod1: 1, mod2: 3 }],
+    ["SM209", { powMod: 1, mod1: 2 }],
+    ["SM309", { powMod: 2, mod1: 2 }]
+  ]);
+  const book = { skill1: "S0000", skill2: "S0000",
+    skill3: "S0000", skill4: "S0000" };
+  const heroes = (powers) => powers.map((pow, index) =>
+    ({ hero: { id: `H${index}`, pow, hp: 100 }, book }));
+  const mob = (id, hp = 100) => ({ id, hpMod: hp / 100, powMod: 1,
+    skill1: id, skill2: "S0000", skill3: "S0000", skill4: "S0000" });
+
+  const spider = { hp: 100, pow: 20 };
+  assert.equal(simulateFloor(heroes([0, 200]), spider, [mob("SM109")], skills, 1).remaining, 140);
+  assert.equal(simulateFloor(heroes([10, 200]), spider, [mob("SM109")], skills, 1).remaining, 180);
+
+  const multi = { hp: 100, pow: 20 };
+  const twoEnemies = [mob("S0000", 10), mob("SM209", 200)];
+  skills.set("S2", { powMod: 1, description: "对所有敌人造成伤害" });
+  const finish = { hero: { id: "H2", hp: 100, pow: 300 },
+    book: { ...book, skill1: "S2" } };
+  assert.equal(simulateFloor([...heroes([0, 0]), finish], multi,
+    twoEnemies, skills, 1).remaining, 180);
+
+  const octopus = [mob("S0000", 10), mob("SM309", 200)];
+  assert.equal(simulateFloor([...heroes([10, 0]), finish], multi,
+    octopus, skills, 1).remaining, 180);
+  assert.equal(simulateFloor([...heroes([10, 10]), finish], multi,
+    octopus, skills, 1).remaining, 60);
+});
+
+test("SM106 heals debuffed allies and removes their debuffs", () => {
+  const skills = new Map([
+    ["S0000", { powMod: 1 }],
+    ["S1010", { powMod: 1, description: "对所有敌人造成伤害" }],
+    ["SM106", { powMod: 0.75 }]
+  ]);
+  const mob = { id: "B106", hpMod: 1, powMod: 1,
+    skill1: "SM106", skill2: "SM106", skill3: "SM106", skill4: "SM106" };
+  const profile = (id) => ({ hero: { id: "H0", hp: 100, pow: 20 },
+    book: { skill1: id, skill2: "S0000", skill3: "S0000", skill4: "S0000" } });
+  const ordinary = simulateFloor([profile("S0000")], { hp: 100, pow: 20 }, [mob], skills, 1);
+  const debuffed = simulateFloor([profile("S1010")], { hp: 100, pow: 20 }, [mob], skills, 1);
+  assert.equal(ordinary.cleared, true);
+  assert.equal(debuffed.cleared, true);
+  assert.equal(ordinary.turns, 9);
+  assert.equal(debuffed.turns, 13);
+});
+
+test("all three X-tier encounters have modeled enemy skills", () => {
+  const profiles = Array.from({ length: 4 }, (_, index) => ({
+    hero: { id: `H${index}`, hp: 1000, pow: 500 },
+    book: { skill1: "S0000", skill2: "S0000",
+      skill3: "S0000", skill4: "S0000" }
+  }));
+  const skills = new Map([["S0000", { powMod: 1 }], ...[
+    ["SM105", 1], ["SM106", 0.75], ["SM109", 1], ["SM204", 1],
+    ["SM205", 1], ["SM207", 1], ["SM209", 1], ["SM305", 1],
+    ["SM307", 3], ["SM308", 1.5], ["SM309", 2]
+  ].map(([id, powMod]) => [id, { powMod }])]);
+  const mob = (id, abilities) => ({ id, hpMod: 1, powMod: 1,
+    skill1: abilities[0] || "S0000", skill2: abilities[1] || "S0000",
+    skill3: abilities[2] || "S0000", skill4: abilities[3] || "S0000" });
+  const mobs = new Map([
+    ["B105", mob("B105", [null, null, null, "SM105"])],
+    ["B106", mob("B106", [null, "SM106"])],
+    ["B109", mob("B109", ["SM109"])],
+    ["B205", mob("B205", ["SM205"])],
+    ["B207", mob("B207", ["SM207"])],
+    ["B204", mob("B204", [null, null, "SM204"])],
+    ["B209", mob("B209", [null, null, null, "SM209"])],
+    ["B305", mob("B305", ["SM305"])],
+    ["B308", mob("B308", [null, null, null, "SM308"])],
+    ["B309", mob("B309", [null, null, "SM309"])],
+    ["B307", mob("B307", [null, null, "SM307"])]
+  ]);
+  for (const [id, ids] of [
+    ["D110", ["B105", "B106", "B109", "B109"]],
+    ["D210", ["B205", "B207", "B204", "B209"]],
+    ["D310", ["B305", "B308", "B309", "B307"]]
+  ]) {
+    const def = { id, mob1: ids[0], mob2: ids[1], mob3: ids[2], mob4: ids[3],
+      hp: 100, pow: 20, hpGain: 0, powGain: 0 };
+    assert.equal(simulateDungeon(profiles, def, mobs, skills, 1).complete, true, id);
+  }
+});
+
 test("unknown enemy skills cannot be counted as harmless", () => {
   const profile = { hero: { hp: 200, pow: 40 }, book: {
     skill1: "S0000", skill2: "S0000", skill3: "S0000", skill4: "S0000"
