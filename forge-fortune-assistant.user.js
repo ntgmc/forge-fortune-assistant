@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Forge & Fortune 战力助手
 // @namespace    https://game.itwmw.com/forge-fortune/
-// @version      3.2.1
-// @description  分析战力并可选自动精通、编队技能与融合
+// @version      3.3.0
+// @description  分析战力并可选后台自动精通、博物馆捐赠、编队技能与融合
 // @match        https://game.itwmw.com/forge-fortune/*
 // @grant        none
 // @run-at       document-idle
@@ -780,6 +780,24 @@
     }).map((recipe) => recipe.id);
   }
 
+  function museumCandidates(save, data) {
+    if (!(save.tm?.buildings || []).some((building) =>
+      building.id === "TB008" && building.status >= 2)) return [];
+    const recipes = indexById(data.recipes);
+    const progress = indexById(save.r);
+    return (save.i || []).filter((item) => {
+      const recipe = recipes.get(item.id);
+      return item.qty > 0 && recipe?.recipeType === "normal" && recipe.type !== "Trinkets" &&
+        Number.isInteger(item.rarity) && item.rarity >= 0 &&
+        Number.isInteger(item.sharp) && item.sharp >= 0 && item.sharp <= 10 &&
+        item.rune === 0 && item.powRatio === recipe.pow && item.hpRatio === recipe.hp &&
+        progress.get(item.id)?.museum?.[item.rarity]?.[item.sharp] === false;
+    }).map((item) => ({
+      id: item.id, rarity: item.rarity, sharp: item.sharp,
+      uniqueID: fusionUniqueID(item, recipes.get(item.id))
+    })).sort((a, b) => b.sharp - a.sharp);
+  }
+
   function fusionCandidates(save, data) {
     const recipes = indexById(data.recipes);
     const gold = (save.rs || []).find((resource) => resource.id === "M001")?.amt || 0;
@@ -916,11 +934,27 @@
     }, 300);
   }
 
+  function triggerGameAction(containerSelector, className, key, value, shiftKey = false) {
+    const container = document.querySelector(containerSelector);
+    if (!container || !window.jQuery) return false;
+    const button = document.createElement("button");
+    button.className = className;
+    if (key === "uniqueid") button.setAttribute(key, value);
+    else if (key) window.jQuery(button).data(key, value);
+    container.append(button);
+    try {
+      button.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey }));
+    } finally {
+      button.remove();
+    }
+    return true;
+  }
+
   if (typeof module !== "undefined" && module.exports) {
     module.exports = { itemStats, heroesFromSave, boostAdvice, adventureAdvice,
-      skillAdvice, equipmentAdvice, analyze, partyScore, bestBooks, freeMastery,
+      skillAdvice, equipmentAdvice, analyze, partyScore, bestBooks, freeMastery, museumCandidates,
       fusionCandidates, fusionBorrowCandidates, fusionUpgradeStep, fusionHasSlot,
-      nextPartyMove, schedulePlaybookDialogClose,
+      nextPartyMove, schedulePlaybookDialogClose, triggerGameAction,
       simulateDungeon, simulateFloor, passesSafetyFloor, compareAdventureTeams,
       adventureWorkerSource, adventureFingerprint, analyzeLiveSave };
   }
@@ -995,7 +1029,8 @@
   try { autoSettings = JSON.parse(localStorage.getItem("ffa-auto-v1") || "{}") || {}; }
   catch { autoSettings = {}; }
   const automation = {};
-  for (const [key, label] of [["mastery", "免费精通"], ["party", "编队与技能"], ["fusion", "重复装备融合"]]) {
+  for (const [key, label] of [["mastery", "免费精通"], ["museum", "博物馆捐赠"],
+    ["party", "编队与技能"], ["fusion", "重复装备融合"]]) {
     const option = document.createElement("label");
     const input = document.createElement("input");
     input.type = "checkbox";
@@ -1014,7 +1049,7 @@
   status.className = "status";
   const actionStatus = document.createElement("div");
   actionStatus.className = "status";
-  actionStatus.textContent = "仅在游戏对应界面打开时执行自动操作。";
+  actionStatus.textContent = "精通、博物馆捐赠和普通融合可在游戏任意页面后台执行；编队需打开选人界面。";
   const body = document.createElement("div");
   panel.append(header, status, actionStatus, body);
   root.append(panel, toggle);
@@ -1029,6 +1064,8 @@
   let solvedAdventure = null;
   let pendingAdventure = null;
   const attemptedMastery = new Set();
+  const attemptedMuseum = new Set();
+  let pendingMuseum = null;
   const attemptedFusion = new Set();
   const fusionPlanKey = "ffa-fusion-upgrade-v1";
   const visible = (element) => element && element.getClientRects().length > 0;
@@ -1056,13 +1093,6 @@
       return false;
     }
     return true;
-  }
-  function showFusionBuilding() {
-    if (visible(document.querySelector("#fuseList"))) return true;
-    const building = document.querySelector("#fusionBldg");
-    if (visible(building)) building.click();
-    else document.querySelector("#townTabLink")?.click();
-    return false;
   }
   function runFusionUpgrade(save) {
     const stored = localStorage.getItem(fusionPlanKey);
@@ -1131,14 +1161,10 @@
       return true;
     }
     if (step === "start") {
-      if (!showFusionBuilding()) return true;
-      const button = [...document.querySelectorAll("#fuseList .fuseStart")]
-        .find((entry) => visible(entry) && entry.getAttribute("uniqueid") === plan.uniqueID);
-      if (!button) return true;
+      if (!triggerGameAction("#fuseList", "fuseStart", "uniqueid", plan.uniqueID, true)) return true;
       plan.stage = "fusing";
       plan.startedAt = Date.now();
       localStorage.setItem(fusionPlanKey, JSON.stringify(plan));
-      button.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true }));
       action(`${plan.heroId}：正在融合 ${plan.id}，完成后自动装备升级品。`);
     }
     return true;
@@ -1212,42 +1238,54 @@
       if (!text) return;
       const save = parseSave(text);
       if (runFusionUpgrade(save)) return;
+      if (pendingMuseum) {
+        if (indexById(save.r).get(pendingMuseum.id)?.museum
+          ?.[pendingMuseum.rarity]?.[pendingMuseum.sharp] === true) pendingMuseum = null;
+        else if (Date.now() - pendingMuseum.startedAt > 15000) {
+          action("等待博物馆捐赠写入实时存档；请检查游戏保存状态。");
+        }
+      }
       if (automation.mastery.checked) {
-        const eligible = new Set(freeMastery(save, config));
-        const button = [...document.querySelectorAll(".recipeMasteryGuildButton, .recipeMasteredStatus")]
-          .find((entry) => visible(entry) && eligible.has(gameData(entry, "rid")) &&
-            !entry.classList.contains("isMastered") &&
-            !attemptedMastery.has(gameData(entry, "rid")));
-        if (button) {
-          const id = gameData(button, "rid");
+        const id = freeMastery(save, config).find((entry) => !attemptedMastery.has(entry));
+        if (id && triggerGameAction("#recipeContents", "recipeMasteredStatus", "rid", id)) {
           attemptedMastery.add(id);
-          button.click();
           action(`已执行免费精通：${indexById(config.recipes).get(id).name}。`);
           return;
         }
       }
+      if (automation.museum.checked && !pendingMuseum) {
+        const item = museumCandidates(save, config).find((entry) =>
+          !attemptedMuseum.has(`${entry.id}_${entry.rarity}_${entry.sharp}`));
+        if (item && !document.querySelector(
+          "#museumRecipeTypes .museumTypeDiv, #museumRecipeContributions .museumBackButton, " +
+          "#museumRecipeContributions .museumRecipeBackButton"
+        )) {
+          triggerGameAction("#museumRecipeContributions", "museumBackButton");
+        }
+        if (item && triggerGameAction("#museumInv", "museumDonate", "uid", item.uniqueID)) {
+          attemptedMuseum.add(`${item.id}_${item.rarity}_${item.sharp}`);
+          pendingMuseum = { id: item.id, rarity: item.rarity, sharp: item.sharp,
+            startedAt: Date.now() };
+          action(`已捐赠博物馆：${indexById(config.recipes).get(item.id).name}（品质 ${item.rarity}，强化 ${item.sharp}）。`);
+          return;
+        }
+      }
       if (automation.party.checked && applyPartyPlan(save)) return;
+      if (pendingMuseum) return;
       if (automation.fusion.checked && fusionHasSlot(save)) {
         const eligible = fusionCandidates(save, config);
-        const button = [...document.querySelectorAll("#fuseList .fuseStart")]
-          .find((entry) => visible(entry) && eligible.some((item) =>
-            item.uniqueID === entry.getAttribute("uniqueid") &&
-            !attemptedFusion.has(`${item.uniqueID}_${item.qty}`)));
-        if (button) {
-          const item = eligible.find((entry) => entry.uniqueID === button.getAttribute("uniqueid"));
+        const item = eligible.find((entry) => !attemptedFusion.has(`${entry.uniqueID}_${entry.qty}`));
+        if (item && triggerGameAction("#fuseList", "fuseStart", "uniqueid", item.uniqueID, true)) {
           attemptedFusion.add(`${item.uniqueID}_${item.qty}`);
-          button.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true }));
           action(`已安排融合 ${item.id}（品质 ${item.rarity}），至少保留一件库存。`);
           return;
         }
-        if (visible(document.querySelector("#fuseList"))) {
-          const borrowed = fusionBorrowCandidates(save, config)[0];
-          if (borrowed) {
-            localStorage.setItem(fusionPlanKey, JSON.stringify({ ...borrowed,
-              stage: "unequip", startedAt: Date.now() }));
-            action(`${borrowed.heroId}：准备卸下 ${borrowed.id} 融合升级，完成后将重新装备。`);
-            return;
-          }
+        const borrowed = fusionBorrowCandidates(save, config)[0];
+        if (borrowed) {
+          localStorage.setItem(fusionPlanKey, JSON.stringify({ ...borrowed,
+            stage: "unequip", startedAt: Date.now() }));
+          action(`${borrowed.heroId}：准备卸下 ${borrowed.id} 融合升级，完成后将重新装备。`);
+          return;
         }
       }
     } catch (error) {

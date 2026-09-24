@@ -5,9 +5,10 @@ const path = require("node:path");
 const zlib = require("node:zlib");
 const vm = require("node:vm");
 const { analyze, itemStats, heroesFromSave, boostAdvice, bestBooks, equipmentAdvice, partyScore,
-  freeMastery, fusionCandidates, fusionBorrowCandidates, fusionUpgradeStep,
+  freeMastery, museumCandidates, fusionCandidates, fusionBorrowCandidates, fusionUpgradeStep,
   fusionHasSlot, nextPartyMove,
-  schedulePlaybookDialogClose, simulateDungeon, simulateFloor, passesSafetyFloor,
+  schedulePlaybookDialogClose, triggerGameAction,
+  simulateDungeon, simulateFloor, passesSafetyFloor,
   compareAdventureTeams, adventureWorkerSource,
   adventureFingerprint, analyzeLiveSave } =
   require("../forge-fortune-assistant.user.js");
@@ -507,6 +508,86 @@ test("free mastery requires ownership, craft threshold, and zero cost", () => {
     { id: "R3", owned: true, craftCount: 50, mastered: true }
   ] };
   assert.deepEqual(freeMastery(progress, data), ["R1"]);
+});
+
+test("museum only donates missing unmodified inventory equipment after unlock", () => {
+  const data = { ...fixture, recipes: [
+    { ...fixture.recipes[0], recipeType: "normal" },
+    { ...fixture.recipes[1], recipeType: "normal", type: "Trinkets" },
+    { ...fixture.recipes[2], recipeType: "gift" }
+  ] };
+  const item = { id: "R1", qty: 1, rarity: 2, sharp: 1, rune: 0,
+    powRatio: 3, hpRatio: 0 };
+  const progress = { ...save,
+    tm: { buildings: [{ id: "TB008", status: 2 }] },
+    r: [{ id: "R1", museum: [[], [], [true, false, false]] }],
+    i: [item, { ...item, sharp: 0 }, { ...item, sharp: 2, qty: 0 },
+      { ...item, rarity: 7 }, { ...item, rune: 1 }, { ...item, powRatio: 4 },
+      { ...item, hpRatio: 1 }, { ...item, id: "R2" }, { ...item, id: "R3" }]
+  };
+  assert.deepEqual(museumCandidates(progress, data), [{
+    id: "R1", rarity: 2, sharp: 1, uniqueID: "R1_2_1_0_0"
+  }]);
+  assert.deepEqual(museumCandidates({ ...progress,
+    tm: { buildings: [{ id: "TB008", status: 1 }] }
+  }, data), []);
+  assert.deepEqual(museumCandidates({ ...progress,
+    r: [{ id: "R1", museum: [[], [], [true, true, false]] }]
+  }, data), []);
+  assert.deepEqual(museumCandidates({ ...progress,
+    r: [{ id: "R1", museum: [[], [], [false, false, false]] }],
+    i: [{ ...item, sharp: 0 }, item]
+  }, data).map((candidate) => candidate.sharp), [1, 0]);
+});
+
+test("background actions use the game's delegated events without changing pages", () => {
+  const originalDocument = global.document;
+  const originalWindow = global.window;
+  const originalMouseEvent = global.MouseEvent;
+  const events = [];
+  const containers = new Map(["#recipeContents", "#museumRecipeContributions",
+    "#museumInv", "#fuseList"].map((id) => [id, {
+    append(button) {
+      button.dispatchEvent = (event) => {
+        events.push({ id, name: button.className, data: button.data,
+          uniqueID: button.attributes?.uniqueid, shiftKey: event.shiftKey });
+      };
+    }
+  }]));
+  try {
+    global.document = {
+      querySelector: (selector) => containers.get(selector),
+      createElement: () => ({
+        setAttribute(key, value) { this.attributes = { [key]: value }; },
+        remove() { this.removed = true; }
+      })
+    };
+    global.window = { jQuery: (button) => ({
+      data(key, value) { button.data = { [key]: value }; }
+    }) };
+    global.MouseEvent = class {
+      constructor(type, options) { this.type = type; this.shiftKey = options.shiftKey; }
+    };
+    assert.equal(triggerGameAction("#recipeContents", "recipeMasteredStatus", "rid", "R1"), true);
+    assert.equal(triggerGameAction("#museumRecipeContributions", "museumBackButton"), true);
+    assert.equal(triggerGameAction("#museumInv", "museumDonate", "uid", "R1_2_1_0_0"), true);
+    assert.equal(triggerGameAction("#fuseList", "fuseStart", "uniqueid", "R1_2_1_0_0", true), true);
+    assert.equal(triggerGameAction("#missing", "fuseStart", "uniqueid", "R1", true), false);
+    assert.deepEqual(events, [
+      { id: "#recipeContents", name: "recipeMasteredStatus",
+        data: { rid: "R1" }, uniqueID: undefined, shiftKey: false },
+      { id: "#museumRecipeContributions", name: "museumBackButton",
+        data: undefined, uniqueID: undefined, shiftKey: false },
+      { id: "#museumInv", name: "museumDonate",
+        data: { uid: "R1_2_1_0_0" }, uniqueID: undefined, shiftKey: false },
+      { id: "#fuseList", name: "fuseStart",
+        data: undefined, uniqueID: "R1_2_1_0_0", shiftKey: true }
+    ]);
+  } finally {
+    global.document = originalDocument;
+    global.window = originalWindow;
+    global.MouseEvent = originalMouseEvent;
+  }
 });
 
 test("fusion reserves one item and requires sufficient gold", () => {
